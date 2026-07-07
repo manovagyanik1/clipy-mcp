@@ -1,0 +1,38 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "online.clipy/mcp",
+  "description": "Read your Clipy screen recordings from any AI agent: search your library, get transcripts, AI summaries, and key moments with frames — e.g. turn a bug-report recording into a ticket or a fix.",
+  "repository": {
+    "url": "https://github.com/manovagyanik1/clipy-mcp",
+    "source": "github"
+  },
+  "websiteUrl": "https://clipy.online/mcp",
+  "version": "0.5.1",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@clipy/mcp",
+      "version": "0.5.1",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "CLIPY_API_KEY",
+          "description": "Clipy API key — create one free at https://clipy.online/settings/api-keys",
+          "isRequired": true,
+          "format": "string",
+          "isSecret": true
+        },
+        {
+          "name": "CLIPY_API_URL",
+          "description": "Override the Clipy API base URL (defaults to https://clipy.online)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false
+        }
+      ]
+    }
+  ]
+}

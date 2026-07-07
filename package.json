@@ -1,7 +1,8 @@
 {
   "name": "@clipy/mcp",
-  "version": "0.3.1",
-  "description": "Model Context Protocol (MCP) server for Clipy — give Claude, Cursor, and other AI agents read access to your screen recordings' transcripts and AI summaries.",
+  "version": "0.5.1",
+  "mcpName": "online.clipy/mcp",
+  "description": "Model Context Protocol (MCP) server for Clipy — give Claude, Cursor, and other AI agents read access to your screen recordings' transcripts, AI summaries, and key moments with frames.",
   "license": "MIT",
   "type": "module",
   "publishConfig": {
@@ -38,7 +39,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@types/node": "^26.1.0",
+    "@types/node": "^20.19.43",
     "typescript": "^5.5.0"
   },
   "repository": {
