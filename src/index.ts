@@ -29,12 +29,14 @@ import { pipeline } from "node:stream/promises";
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
 
+// The key is checked lazily (per tool call, not at startup) so the server can
+// start and answer introspection (initialize / tools/list) in keyless
+// environments like directory health checks.
 if (!API_KEY) {
   process.stderr.write(
-    "[clipy-mcp] Missing CLIPY_API_KEY. Create one at " +
-      `${API_URL}/settings/api-keys and set it in your MCP client config.\n`,
+    "[clipy-mcp] CLIPY_API_KEY is not set — tools will error until it is. " +
+      `Create one at ${API_URL}/settings/api-keys and set it in your MCP client config.\n`,
   );
-  process.exit(1);
 }
 
 type Json = Record<string, unknown>;
@@ -43,6 +45,12 @@ const FETCH_TIMEOUT_MS = 20_000;
 
 /** Calls the Clipy v1 API with the API key. Throws on non-2xx or timeout. */
 async function api(path: string): Promise<Json> {
+  if (!API_KEY) {
+    throw new Error(
+      `Missing CLIPY_API_KEY. Create a free API key at ${API_URL}/settings/api-keys ` +
+        "and set it in your MCP client config, then try again.",
+    );
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   let res: Response;
@@ -51,7 +59,7 @@ async function api(path: string): Promise<Json> {
       headers: {
         Authorization: `Bearer ${API_KEY}`,
         Accept: "application/json",
-        "User-Agent": "clipy-mcp/0.5.1",
+        "User-Agent": "clipy-mcp/0.5.2",
       },
       signal: controller.signal,
     });
@@ -92,7 +100,7 @@ function fail(message: string) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const server = new McpServer({ name: "clipy", version: "0.5.1" });
+const server = new McpServer({ name: "clipy", version: "0.5.2" });
 
 const recordingIdSchema = z
   .string()
