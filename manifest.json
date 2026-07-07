@@ -1,0 +1,49 @@
+{
+  "manifest_version": "0.2",
+  "name": "clipy",
+  "display_name": "Clipy",
+  "version": "0.5.2",
+  "description": "Read your Clipy screen recordings: search, transcripts, AI summaries, and key moments with frames.",
+  "long_description": "Clipy is an agent-readable screen recorder (free, no watermark — Mac, Chrome, web). This extension gives Claude read-only access to your Clipy recordings: search your library, fetch timestamped transcripts, AI summaries, and key moments with the actual video frames (click markers burned in) as inline images. The `get_agent_context` tool bundles everything in one call — e.g. \"read this bug-report recording and ship the fix.\" It can never create, modify, or delete recordings.",
+  "author": {
+    "name": "Clipy",
+    "email": "support@clipy.online",
+    "url": "https://clipy.online"
+  },
+  "homepage": "https://clipy.online/mcp",
+  "documentation": "https://clipy.online/docs/mcp",
+  "support": "https://github.com/manovagyanik1/clipy-mcp/issues",
+  "icon": "icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/manovagyanik1/clipy-mcp"
+  },
+  "license": "MIT",
+  "keywords": ["screen-recording", "transcript", "video", "summary", "loom-alternative"],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "CLIPY_API_KEY": "${user_config.api_key}"
+      }
+    }
+  },
+  "user_config": {
+    "api_key": {
+      "type": "string",
+      "title": "Clipy API Key",
+      "description": "Create a free API key at https://clipy.online/settings/api-keys (looks like clipy_sk_live_…).",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  }
+}
