@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "online.clipy/mcp",
-  "description": "Read your Clipy screen recordings from any AI agent: search your library, get transcripts, AI summaries, and key moments with frames — e.g. turn a bug-report recording into a ticket or a fix.",
+  "description": "Read your Clipy screen recordings: search, transcripts, AI summaries, and key moments with frames.",
   "repository": {
     "url": "https://github.com/manovagyanik1/clipy-mcp",
     "source": "github"
