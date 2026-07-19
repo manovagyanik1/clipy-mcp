@@ -23,9 +23,23 @@ delete anything.
 
 ## Setup
 
-1. Create a free API key at **https://clipy.online/settings/api-keys** (it looks like
-   `clipy_sk_live_…`). Copy it — it's shown only once.
-2. Add the server to your MCP client.
+This is a headless server process, so it authenticates with a Clipy API key in the
+`CLIPY_API_KEY` env var (it looks like `clipy_sk_live_…`). The easiest way to get one is
+the Clipy CLI's browser login:
+
+```bash
+npx @clipy/cli@latest login
+```
+
+It opens your browser; click **Approve** once. The key is saved to
+`~/.config/clipy/config.json` — copy its `apiKey` value into `CLIPY_API_KEY` when you add
+the server below.
+
+**Prefer to mint one by hand?** Create a key at
+**https://clipy.online/settings/api-keys** instead (it's shown only once — copy it
+immediately).
+
+Then add the server to your MCP client.
 
 ### Claude Code
 

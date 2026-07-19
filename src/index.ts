@@ -10,9 +10,12 @@
  * headline write use case is "build a feature, then record the outcome."
  *
  * Auth: a personal API key (`CLIPY_API_KEY`, looks like `clipy_sk_live_…`),
- * minted at https://clipy.online/settings/api-keys. Read tools need any key;
- * the `record` tool additionally needs the key to carry the `ingest` scope
- * ("Record & upload"). Everything except `record` is read-only.
+ * minted at https://clipy.online/settings/api-keys. Read tools need the default
+ * `recordings:read` scope; the write tools — `record`, the session tools
+ * (start_recording, add_marker, stop_recording, abort_recording), and
+ * `replace_transcript` — additionally need the key to carry the `ingest` scope
+ * ("Record & upload"), enforced server-side. A `recordings:read`-only key cannot
+ * create, modify, or delete anything.
  *
  * Config (env):
  *   CLIPY_API_KEY   (required)  your personal key
@@ -62,7 +65,7 @@ async function api(path: string): Promise<Json> {
       headers: {
         Authorization: `Bearer ${API_KEY}`,
         Accept: "application/json",
-        "User-Agent": "clipy-mcp/0.7.0",
+        "User-Agent": "clipy-mcp/0.7.1",
       },
       signal: controller.signal,
     });
@@ -109,7 +112,7 @@ async function apiPostJson(path: string, payload: unknown, method: "POST" | "PUT
           Authorization: `Bearer ${API_KEY}`,
           "Content-Type": "application/json",
           Accept: "application/json",
-          "User-Agent": "clipy-mcp/0.7.0",
+          "User-Agent": "clipy-mcp/0.7.1",
         },
         body: JSON.stringify(payload),
         signal: controller.signal,
@@ -170,7 +173,7 @@ async function apiPostChunk(
     try {
       res = await fetch(`${API_URL}/api/videos/raw-upload/chunk`, {
         method: "POST",
-        headers: { Authorization: `Bearer ${API_KEY}`, "User-Agent": "clipy-mcp/0.7.0" },
+        headers: { Authorization: `Bearer ${API_KEY}`, "User-Agent": "clipy-mcp/0.7.1" },
         body: form,
         signal: controller.signal,
       });
@@ -273,7 +276,7 @@ async function uploadCapturedWebm(opts: {
       recordingId,
       createVideoRow: true,
       sourcePlatform: "web",
-      sourceVersion: "mcp/0.7.0",
+      sourceVersion: "mcp/0.7.1",
     });
     uploadToken = String(init.uploadToken ?? "");
     publicId = String(init.publicId ?? "");
@@ -303,7 +306,7 @@ async function uploadCapturedWebm(opts: {
       name: opts.name,
       description: opts.description,
       sourcePlatform: "web",
-      sourceVersion: "mcp/0.7.0",
+      sourceVersion: "mcp/0.7.1",
       ...(opts.narration && (opts.narration.text || opts.narration.notes?.length)
         ? { narration: opts.narration }
         : {}),
@@ -331,7 +334,7 @@ function fail(message: string) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const server = new McpServer({ name: "clipy", version: "0.7.0" });
+const server = new McpServer({ name: "clipy", version: "0.7.1" });
 
 const recordingIdSchema = z
   .string()
