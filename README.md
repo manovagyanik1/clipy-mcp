@@ -97,9 +97,9 @@ or the Windsurf MCP config) directly:
 | `download_recording` | Download the MP4 locally so you can clip it or extract frames yourself (e.g. with ffmpeg). |
 | `get_key_moments` | Key moments: timestamps, captions, and click coordinates. |
 | `get_agent_context` | The full agent-context bundle (summary + key moments + transcript) as markdown. |
-| `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts a `type` (recording kind), `viewports` (sweep several screen sizes into one video), `storageState`/`initScript` (record behind a login), and timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
-| `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Accepts `type`, `storageState`/`initScript`, and `exposeCdp` (get a CDP endpoint to drive the recorded page). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
-| `add_marker` | Drop a narration marker into the active session (live clock, or backdate with `atSeconds`) — markers become the recording's transcript chapters. Can also **verify** on-screen state (`assertSelector` / `assertText` (requires a selector) / `assertUrl`, `failMode`); a failed assertion is annotated as an explicit failure and can abort the session. Navigations + console errors are added automatically as `[auto]` marks. |
+| `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts a `type` (recording kind), `viewports` (sweep several screen sizes into one video), `storageState`/`userDataDir`/`initScript` (record behind a login), and timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
+| `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Accepts `type`, `storageState`/`userDataDir`/`initScript`, and `exposeCdp` (get a CDP endpoint + in-page `window.__clipyMark`/`window.__clipyChapter` bridge to drive the recorded page). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
+| `add_marker` | Drop a narration marker into the active session (live clock, or backdate with `atSeconds`) — markers become the recording's transcript chapters. Can also **verify** on-screen state (`assertSelector` / `assertText` (requires a selector) / `assertUrl`, `failMode`); an assertion is annotated as a pass (✓), an explicit failure (✗, can abort the session), or **unverified** (⚠, when it couldn't be evaluated — never a silent pass). Navigations + console errors are added automatically as `[auto]` marks. |
 | `add_chapter` | Drop a `=== CHAPTER: <label> ===` boundary into the active session — split a recording into named sections (ideal for before/after demos). |
 | `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
 | `abort_recording` | Discard the active session; nothing is uploaded. |
@@ -133,6 +133,14 @@ per viewport pass), `name`, `description`, `type` (recording kind — `bug_repor
 each pass slow-scrolled and auto-chaptered), `storageState` / `initScript` (paths, never
 logged), `notes`, and `width`/`height` (default 1280×720, ignored when `viewports` is set).
 
+**Recording behind a login.** `storageState` seeds exactly what its JSON contains (cookies +
+localStorage) but can't reproduce a whole browser identity (IndexedDB, service workers, some
+cross-origin auth). For a full identity, produce a storageState with an interactive login
+(`npx playwright open --save-storage=state.json <login-url>`) and pass its path, **or** pass
+`userDataDir` pointed at a **dedicated** Chromium profile directory — one no running browser
+is using (a live/locked profile is refused). `storageState` and `userDataDir` are mutually
+exclusive.
+
 ### Driving the recorded page over CDP (`start_recording` + `exposeCdp: true`)
 
 Pass `exposeCdp: true` to `start_recording` and the recording browser opens a Chrome
@@ -152,6 +160,21 @@ It's **off by default** — while it's open, any local process can attach to tha
 is `contexts()[0].pages()[0]` (a new context you open won't be captured); `page.viewportSize()`
 reads `null` over a CDP attach; and to change the viewport use `newCDPSession` +
 `Emulation.setDeviceMetricsOverride`, not `setViewportSize`.
+
+**In-page bridge (zero extra tool calls).** When `exposeCdp` is on, the recorded page also
+exposes `window.__clipyMark(text, opts?)` and `window.__clipyChapter(label)`, so your CDP
+driver can drop asserted marks/chapters from inside the page:
+
+```js
+await page.evaluate(() =>
+  window.__clipyMark("saved the form", { assertSelector: ".toast", assertText: "Saved" }),
+);
+await page.evaluate(() => window.__clipyChapter("AFTER — fix applied"));
+```
+
+`opts` mirrors `add_marker` (`assertSelector` / `assertText` / `assertUrl` / `failMode`);
+`assertText` requires `assertSelector` (the call rejects otherwise), and a failed assert with
+`failMode: "abort"` discards the session — same annotations and tally as the tools.
 
 ## Config
 

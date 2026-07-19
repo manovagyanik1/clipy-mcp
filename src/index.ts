@@ -25,7 +25,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { closeSync, createWriteStream, mkdirSync, openSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
+import { closeSync, createWriteStream, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -35,7 +35,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.0";
+const SERVER_VERSION = "0.8.1";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -213,7 +213,12 @@ interface PwPage {
 }
 interface PwContext {
   newPage(): Promise<PwPage>;
+  pages(): PwPage[];
   addInitScript(script: { path?: string; content?: string }): Promise<void>;
+  exposeBinding(
+    name: string,
+    callback: (source: unknown, ...args: unknown[]) => unknown,
+  ): Promise<void>;
   close(): Promise<void>;
 }
 interface PwBrowser {
@@ -222,6 +227,9 @@ interface PwBrowser {
 }
 interface PwChromium {
   launch(opts: Record<string, unknown>): Promise<PwBrowser>;
+  // Persistent-profile mode (userDataDir): returns the context directly, with no
+  // separate Browser handle — closing the context closes the browser.
+  launchPersistentContext(userDataDir: string, opts: Record<string, unknown>): Promise<PwContext>;
 }
 
 async function loadChromium(): Promise<PwChromium> {
@@ -442,7 +450,8 @@ const CDP_DRIVER_NOTE =
   "Gotchas: (1) the page being recorded is browser.contexts()[0].pages()[0] — a NEW context/page you open is NOT captured; " +
   "(2) page.viewportSize() reads null over a CDP attach; " +
   "(3) to change the viewport use page.context().newCDPSession(page) + Emulation.setDeviceMetricsOverride, not setViewportSize; " +
-  "(4) close your connection (browser.close()) when done — it only detaches, the recording keeps going.";
+  "(4) close your connection (browser.close()) when done — it only detaches, the recording keeps going. " +
+  "In-page bridge (zero extra tool calls): call window.__clipyMark(text, {assertSelector, assertText, assertUrl, failMode}) to drop an asserted mark and window.__clipyChapter(label) for a chapter — from the recorded page, e.g. await page.evaluate(() => window.__clipyMark('saved', {assertSelector:'.toast', assertText:'Saved'})); assertText requires assertSelector (the call rejects otherwise), and a failed assert with failMode:'abort' discards the session.";
 
 // --- URL-glob matching (add_marker assertUrl) ------------------------------
 // `**` matches anything (including `/`); `*` matches within a path segment.
@@ -530,6 +539,100 @@ function validateInitScriptFile(p: string): string {
     throw new Error(`initScript file is not readable: ${resolved}`);
   }
   return resolved;
+}
+
+/** Validate a userDataDir (a whole Chromium profile) — resolves, confirms it's a
+ *  directory, and REFUSES a live/locked profile (Chrome leaves SingletonLock /
+ *  SingletonSocket while running). Returns the absolute path. */
+function validateUserDataDir(p: string): string {
+  const resolved = resolve(p);
+  let st;
+  try {
+    st = statSync(resolved);
+  } catch {
+    throw new Error(`userDataDir not found: ${resolved}`);
+  }
+  if (!st.isDirectory()) throw new Error(`userDataDir is not a directory: ${resolved}`);
+  let entries: string[];
+  try {
+    entries = readdirSync(resolved);
+  } catch {
+    throw new Error(`userDataDir is not readable: ${resolved}`);
+  }
+  // Match by NAME (these are often symlinks/sockets that statSync can't follow).
+  if (entries.includes("SingletonLock") || entries.includes("SingletonSocket")) {
+    throw new Error(
+      `userDataDir looks like a LIVE Chrome profile — found a Singleton lock in ${resolved}. ` +
+        `Close that browser, or point userDataDir at a DEDICATED profile directory no running browser is using. ` +
+        `Driving a locked profile fails and risks corrupting it.`,
+    );
+  }
+  return resolved;
+}
+
+/** First line of an error message, trimmed — keeps annotations/logs one-line. */
+function firstLine(message: string | undefined): string {
+  return (message ?? "").split("\n")[0].trim();
+}
+
+/** Race a promise against a timeout so a hung page.evaluate can't wedge a mark. */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
+  ]);
+}
+
+interface OpenedCapture {
+  context: PwContext;
+  page: PwPage;
+  /** null in persistent (userDataDir) mode — closing the context closes the browser. */
+  browser: PwBrowser | null;
+}
+
+/** Open the recording context + page. Persistent (userDataDir) mode uses
+ *  launchPersistentContext (a whole browser profile, no separate Browser
+ *  handle); otherwise launch + newContext, optionally seeded with storageState.
+ *  initScript applies either way; storageState and userDataDir are mutually
+ *  exclusive and validated before this is called. */
+async function openCaptureContext(
+  chromium: PwChromium,
+  opts: {
+    userDataDir?: string;
+    viewport: { width: number; height: number };
+    recordDir: string;
+    recordSize: { width: number; height: number };
+    storageStatePath?: string;
+    initScriptPath?: string;
+    cdpPort?: number;
+  },
+): Promise<OpenedCapture> {
+  const args = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    ...(opts.cdpPort ? [`--remote-debugging-port=${opts.cdpPort}`] : []),
+  ];
+  if (opts.userDataDir) {
+    const context = await chromium.launchPersistentContext(opts.userDataDir, {
+      headless: true,
+      args,
+      viewport: opts.viewport,
+      recordVideo: { dir: opts.recordDir, size: opts.recordSize },
+    });
+    if (opts.initScriptPath) await context.addInitScript({ path: opts.initScriptPath });
+    const existing = context.pages();
+    const page = existing.length > 0 ? existing[0] : await context.newPage();
+    return { context, page, browser: null };
+  }
+  const browser = await chromium.launch({ headless: true, args });
+  const context = await browser.newContext({
+    viewport: opts.viewport,
+    recordVideo: { dir: opts.recordDir, size: opts.recordSize },
+    ...(opts.storageStatePath ? { storageState: opts.storageStatePath } : {}),
+  });
+  if (opts.initScriptPath) await context.addInitScript({ path: opts.initScriptPath });
+  const page = await context.newPage();
+  return { context, page, browser };
 }
 
 /**
@@ -1193,7 +1296,7 @@ server.tool(
 
 server.tool(
   "record",
-  "Record a web app HEADLESSLY and upload it as a Clipy recording, then return its share link + agent-context URL. Use this to capture the outcome of work you just did — e.g. after building a feature, record the running app so it can be shared or read back. Opens the given URL in a headless Chromium (works in cloud sandboxes, no display needed), records for `durationSeconds`, and streams the video into Clipy's pipeline. Set `type` so the summary reads the recording correctly, `viewports` to sweep multiple screen sizes into one video, and `storageState`/`initScript` to record behind a login. Requires (1) Playwright installed in this MCP server's environment (`npm i -g playwright && npx playwright install chromium`) and (2) the CLIPY_API_KEY to carry the 'ingest' scope. Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy record --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is a CLI-only convenience; `storageState` covers the same need here. After it returns, call wait_for_artifacts then get_agent_context to read the transcript/summary.",
+  "Record a web app HEADLESSLY and upload it as a Clipy recording, then return its share link + agent-context URL. Use this to capture the outcome of work you just did — e.g. after building a feature, record the running app so it can be shared or read back. Opens the given URL in a headless Chromium (works in cloud sandboxes, no display needed), records for `durationSeconds`, and streams the video into Clipy's pipeline. Set `type` so the summary reads the recording correctly, `viewports` to sweep multiple screen sizes into one video, and `storageState`/`initScript`/`userDataDir` to record behind a login. Requires (1) Playwright installed in this MCP server's environment (`npm i -g playwright && npx playwright install chromium`) and (2) the CLIPY_API_KEY to carry the 'ingest' scope. Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy record --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is a CLI-only convenience; `storageState` covers the same need here. Auth note: `storageState` seeds exactly what it contains (cookies + localStorage) but can't reproduce a whole browser identity (IndexedDB, service workers, some cross-origin auth); for those, produce a storageState via an interactive `npx playwright open --save-storage=state.json <login-url>` first, or use `userDataDir` pointed at a DEDICATED (never live) profile directory. After it returns, call wait_for_artifacts then get_agent_context to read the transcript/summary.",
   {
     url: z.string().describe("The http(s) URL to open and record (e.g. http://localhost:3000)."),
     durationSeconds: z
@@ -1233,7 +1336,13 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Path to a Playwright storageState JSON (cookies + localStorage) to record behind a login. Passed unchanged to the browser context; its contents are never logged.",
+        "Path to a Playwright storageState JSON (cookies + localStorage) to record behind a login. Passed unchanged to the browser context; its contents are never logged. Mutually exclusive with userDataDir.",
+      ),
+    userDataDir: z
+      .string()
+      .optional()
+      .describe(
+        "Path to a DEDICATED Chromium user-data (profile) directory to record with a full browser identity — launched via launchPersistentContext. Use a profile NO running browser is using (a live/locked profile is refused). Mutually exclusive with storageState.",
       ),
     initScript: z
       .string()
@@ -1244,7 +1353,7 @@ server.tool(
     width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280). Ignored when `viewports` is set."),
     height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720). Ignored when `viewports` is set."),
   },
-  async ({ url, durationSeconds, name, description, type, viewports, notes, storageState, initScript, width, height }) => {
+  async ({ url, durationSeconds, name, description, type, viewports, notes, storageState, userDataDir, initScript, width, height }) => {
     // Validate the URL before spinning up a browser.
     let target: URL;
     try {
@@ -1281,10 +1390,17 @@ server.tool(
       width: Math.max(...passes.map((v) => v.width)),
       height: Math.max(...passes.map((v) => v.height)),
     };
+    if (userDataDir && storageState) {
+      return fail(
+        "userDataDir and storageState are mutually exclusive — userDataDir launches a whole persistent profile; storageState seeds a fresh context. Pick one.",
+      );
+    }
     let storageStatePath: string | undefined;
+    let userDataDirPath: string | undefined;
     let initScriptPath: string | undefined;
     try {
       if (storageState) storageStatePath = validateStorageStateFile(storageState);
+      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir);
       if (initScript) initScriptPath = validateInitScriptFile(initScript);
     } catch (e) {
       return fail((e as Error).message);
@@ -1308,18 +1424,16 @@ server.tool(
     try {
       // ── Capture ──
       let videoPath: string;
-      const browser = await chromium.launch({
-        headless: true,
-        args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      const opened = await openCaptureContext(chromium, {
+        userDataDir: userDataDirPath,
+        viewport: { width: frame.width, height: frame.height },
+        recordDir: dir,
+        recordSize: frame,
+        storageStatePath,
+        initScriptPath,
       });
+      const { context, page } = opened;
       try {
-        const context = await browser.newContext({
-          viewport: { width: frame.width, height: frame.height },
-          recordVideo: { dir, size: frame },
-          ...(storageStatePath ? { storageState: storageStatePath } : {}),
-        });
-        if (initScriptPath) await context.addInitScript({ path: initScriptPath });
-        const page = await context.newPage();
         // captureStart is set AFTER the first meaningful paint so notes and pass
         // marks aren't anchored to the blank t=0 a compiling app shows.
         let captureStart = 0;
@@ -1356,7 +1470,10 @@ server.tool(
         if (!video) throw new Error("browser did not produce a video");
         videoPath = await video.path();
       } finally {
-        await browser.close().catch(() => {});
+        // Non-persistent: close the browser (also closes the context). Persistent:
+        // no browser handle — make sure the context is closed either way.
+        if (opened.browser) await opened.browser.close().catch(() => {});
+        else await opened.context.close().catch(() => {});
       }
 
       // ── Upload through the same pipeline the web/desktop clients use ──
@@ -1413,7 +1530,8 @@ const SESSION_DEFAULT_MAX_SEC = 600;
 const SESSION_HARD_CAP_SEC = 1800;
 
 interface McpRecordingSession {
-  browser: PwBrowser;
+  /** null in persistent (userDataDir) mode — closing the context closes the browser. */
+  browser: PwBrowser | null;
   context: PwContext;
   page: PwPage;
   tmpDir: string;
@@ -1424,9 +1542,10 @@ interface McpRecordingSession {
   maxSec: number;
   recordStartEpochMs: number;
   marks: NarrationNote[];
-  /** Assertion tally (add_marker) — surfaced as a [verification] transcript note. */
+  /** Assertion tally (add_marker / CDP bridge) — surfaced as a [verification] note. */
   assertPassed: number;
   assertFailed: number;
+  assertUnverified: number;
   /** CDP endpoints when the session was started with exposeCdp (else undefined). */
   cdpUrl?: string;
   cdpHttpUrl?: string;
@@ -1463,15 +1582,16 @@ function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Pr
       }
       if (!video) throw new Error("browser did not produce a video");
       const videoPath = await video.path();
-      await session.browser.close().catch(() => {});
+      await session.browser?.close().catch(() => {});
       const collected = [...session.marks];
       // If any assertions ran, lead the transcript with a verification summary
-      // at 0ms so a reader sees the pass/fail tally up front.
-      const assertionsRan = session.assertPassed + session.assertFailed;
+      // at 0ms so a reader sees the pass/fail/unverified tally up front.
+      const assertionsRan = session.assertPassed + session.assertFailed + session.assertUnverified;
       if (assertionsRan > 0) {
+        const unverifiedClause = session.assertUnverified > 0 ? `, ${session.assertUnverified} unverified` : "";
         collected.unshift({
           startMs: 0,
-          text: `[verification] ${assertionsRan} assertions: ${session.assertPassed} passed, ${session.assertFailed} failed`,
+          text: `[verification] ${assertionsRan} assertion${assertionsRan === 1 ? "" : "s"}: ${session.assertPassed} passed, ${session.assertFailed} failed${unverifiedClause}`,
         });
       }
       const notes = collected.sort((a, b) => a.startMs - b.startMs);
@@ -1491,7 +1611,9 @@ function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Pr
         next: "Processing runs in the background. Call wait_for_artifacts with this id, then get_agent_context to verify the recording before sharing the link.",
       } as Json;
     } finally {
-      await session.browser.close().catch(() => {});
+      // Persistent mode has no browser handle; make sure the context is closed.
+      if (session.browser) await session.browser.close().catch(() => {});
+      else await session.context.close().catch(() => {});
       try {
         rmSync(session.tmpDir, { recursive: true, force: true });
       } catch {
@@ -1529,13 +1651,19 @@ server.tool(
       .boolean()
       .optional()
       .describe(
-        "Open a Chrome DevTools Protocol endpoint on the recording browser (default false) so you can drive the page (navigate/click/type) with your own Playwright WHILE it records. When on, the result returns cdpHttpUrl + cdpUrl and driver notes. OFF by default (while open, any local process can attach). The env var CLIPY_DISABLE_CDP=1 is a hard kill switch that forces it off.",
+        "Open a Chrome DevTools Protocol endpoint on the recording browser (default false) so you can drive the page (navigate/click/type) with your own Playwright WHILE it records. When on, the result returns cdpHttpUrl + cdpUrl and driver notes, AND the recorded page exposes window.__clipyMark(text, {assertSelector, assertText, assertUrl, failMode}) + window.__clipyChapter(label) so a CDP driver can drop asserted marks/chapters with zero extra tool calls. OFF by default (while open, any local process can attach). The env var CLIPY_DISABLE_CDP=1 is a hard kill switch that forces it off.",
       ),
     storageState: z
       .string()
       .optional()
       .describe(
-        "Path to a Playwright storageState JSON (cookies + localStorage) to record behind a login. Passed unchanged to the browser context; its contents are never logged.",
+        "Path to a Playwright storageState JSON (cookies + localStorage) to record behind a login. Passed unchanged to the browser context; its contents are never logged. Mutually exclusive with userDataDir.",
+      ),
+    userDataDir: z
+      .string()
+      .optional()
+      .describe(
+        "Path to a DEDICATED Chromium user-data (profile) directory to record with a full browser identity (launchPersistentContext). Use a profile NO running browser is using (a live/locked profile is refused). Mutually exclusive with storageState.",
       ),
     initScript: z
       .string()
@@ -1546,7 +1674,7 @@ server.tool(
     width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280)."),
     height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720)."),
   },
-  async ({ url, name, description, type, maxSeconds, exposeCdp, storageState, initScript, width, height }) => {
+  async ({ url, name, description, type, maxSeconds, exposeCdp, storageState, userDataDir, initScript, width, height }) => {
     let target: URL;
     try {
       target = new URL(url);
@@ -1571,10 +1699,17 @@ server.tool(
       if (!kind) return fail(recordingKindError(type));
       recordingKind = kind;
     }
+    if (userDataDir && storageState) {
+      return fail(
+        "userDataDir and storageState are mutually exclusive — userDataDir launches a whole persistent profile; storageState seeds a fresh context. Pick one.",
+      );
+    }
     let storageStatePath: string | undefined;
+    let userDataDirPath: string | undefined;
     let initScriptPath: string | undefined;
     try {
       if (storageState) storageStatePath = validateStorageStateFile(storageState);
+      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir);
       if (initScript) initScriptPath = validateInitScriptFile(initScript);
     } catch (e) {
       return fail((e as Error).message);
@@ -1600,21 +1735,16 @@ server.tool(
 
     try {
       const cdpPort = wantCdp ? await pickFreePort().catch(() => 0) : 0;
-      const browser = await chromium.launch({
-        headless: true,
-        args: [
-          "--no-sandbox",
-          "--disable-dev-shm-usage",
-          ...(cdpPort ? [`--remote-debugging-port=${cdpPort}`] : []),
-        ],
-      });
-      const context = await browser.newContext({
+      const opened = await openCaptureContext(chromium, {
+        userDataDir: userDataDirPath,
         viewport: { width: w, height: h },
-        recordVideo: { dir: tmpDirPath, size: { width: w, height: h } },
-        ...(storageStatePath ? { storageState: storageStatePath } : {}),
+        recordDir: tmpDirPath,
+        recordSize: { width: w, height: h },
+        storageStatePath,
+        initScriptPath,
+        cdpPort: cdpPort || undefined,
       });
-      if (initScriptPath) await context.addInitScript({ path: initScriptPath });
-      const page = await context.newPage();
+      const { context, page, browser } = opened;
 
       // Best-effort CDP discovery — the recording works even if it fails.
       let cdpUrl: string | undefined;
@@ -1643,11 +1773,45 @@ server.tool(
         marks: [],
         assertPassed: 0,
         assertFailed: 0,
+        assertUnverified: 0,
         cdpUrl,
         cdpHttpUrl,
         maxTimer: setTimeout(() => {}, 0),
         finishing: null,
       };
+
+      // In-page CDP bridge: when CDP is exposed, install window.__clipyMark /
+      // window.__clipyChapter so a driver attached over connectOverCDP can drop
+      // asserted marks/chapters without any extra MCP tool call. exposeBinding
+      // routes the page call back to THIS process (same annotations/caps as the
+      // add_marker/add_chapter tools). Installed before navigation so it's live
+      // on first load.
+      if (wantCdp) {
+        await context
+          .exposeBinding("__clipyMark", async (_source: unknown, ...args: unknown[]) => {
+            if (session.finishing) throw new Error("recording session is finishing — mark ignored");
+            const markText = String(args[0] ?? "").slice(0, 1000);
+            const { note, assertion, aborted } = await applyMark(session, markText, coerceMarkOpts(args[1]));
+            return {
+              atSeconds: Math.round(note.startMs / 100) / 10,
+              ...(assertion
+                ? assertion.status === "unverified"
+                  ? { unverified: true, observed: assertion.observed }
+                  : { passed: assertion.status === "passed", observed: assertion.observed }
+                : {}),
+              ...(aborted ? { aborted: true } : {}),
+            };
+          })
+          .catch((e: Error) => serverLog(`__clipyMark binding failed: ${firstLine(e.message)}`));
+        await context
+          .exposeBinding("__clipyChapter", async (_source: unknown, ...args: unknown[]) => {
+            if (session.finishing) throw new Error("recording session is finishing — chapter ignored");
+            const label = String(args[0] ?? "").trim().slice(0, 200);
+            const note = sessionMark(session, `=== CHAPTER: ${label} ===`);
+            return { atSeconds: Math.round(note.startMs / 100) / 10, chapter: label };
+          })
+          .catch((e: Error) => serverLog(`__clipyChapter binding failed: ${firstLine(e.message)}`));
+      }
       clearTimeout(session.maxTimer);
       session.maxTimer = setTimeout(() => {
         // Auto-stop rail: upload the partial rather than record forever.
@@ -1716,10 +1880,13 @@ server.tool(
   },
 );
 
-// --- add_marker assertions -------------------------------------------------
+// --- Marker assertions ------------------------------------------------------
 // The session page is in-process, so an assertion is evaluated at mark time
 // against the live DOM/URL. The outcome is folded into the mark text so a
-// failure can never be misread as fact, and returned to the caller.
+// failure — or an inability to check — can never be misread as fact, and is
+// returned to the caller. Shared by add_marker AND the in-page CDP bridge.
+
+const ASSERT_EVAL_TIMEOUT_MS = 15_000;
 
 interface AssertInput {
   assertSelector?: string;
@@ -1727,60 +1894,157 @@ interface AssertInput {
   assertUrl?: string;
 }
 interface AssertOutcome {
-  passed: boolean;
+  /** passed = verified true; failed = verified false; unverified = couldn't check. */
+  status: "passed" | "failed" | "unverified";
   expected: string;
   observed: string;
 }
 
 async function runMarkerAssertions(page: PwPage, a: AssertInput): Promise<AssertOutcome> {
-  // One page.evaluate reads whatever the selected assertions need. `document`
-  // is a browser global; the cast keeps it out of the (DOM-less) server lib.
-  // assertText is always paired with assertSelector (enforced by the caller),
-  // so text is read from the selector's element — never a weak page-body match.
-  const probe = await page.evaluate<
-    { selectorExists: boolean | null; selectorText: string | null },
-    string | null
-  >((sel) => {
-    const doc = (globalThis as unknown as {
-      document?: { querySelector(s: string): { textContent: string | null } | null };
-    }).document;
-    let selectorExists: boolean | null = null;
-    let selectorText: string | null = null;
-    if (sel && doc) {
-      const el = doc.querySelector(sel);
-      selectorExists = !!el;
-      if (el) selectorText = (el.textContent || "").replace(/\s+/g, " ").trim();
-    }
-    return { selectorExists, selectorText };
-  }, a.assertSelector ?? null);
-
-  const url = page.url();
   const expected: string[] = [];
   const observed: string[] = [];
-  let passed = true;
+  let failed = false;
 
+  // URL is cheap + reliable (no page.evaluate), so check it first.
+  if (a.assertUrl) {
+    const url = page.url();
+    expected.push(`url matches ${JSON.stringify(a.assertUrl)}`);
+    observed.push(`url ${JSON.stringify(url)}`);
+    if (!globMatch(url, a.assertUrl)) failed = true;
+  }
+
+  // DOM checks need page.evaluate — which can throw (invalid selector, page
+  // detached mid-navigation) or hang (bound by ASSERT_EVAL_TIMEOUT_MS). Either
+  // way we must NOT report a pass we couldn't confirm — that's `unverified`.
   if (a.assertSelector) {
-    expected.push(`selector ${JSON.stringify(a.assertSelector)} present`);
+    expected.push(
+      a.assertText
+        ? `selector ${JSON.stringify(a.assertSelector)} present with text ${JSON.stringify(a.assertText)}`
+        : `selector ${JSON.stringify(a.assertSelector)} present`,
+    );
+    let probe: { selectorExists: boolean | null; selectorText: string | null };
+    try {
+      probe = await withTimeout(
+        // `document` is a browser global; the cast keeps it out of the (DOM-less)
+        // server lib. assertText is always paired with a selector (caller-enforced).
+        page.evaluate<{ selectorExists: boolean | null; selectorText: string | null }, string | null>((sel) => {
+          const doc = (globalThis as unknown as {
+            document?: { querySelector(s: string): { textContent: string | null } | null };
+          }).document;
+          let selectorExists: boolean | null = null;
+          let selectorText: string | null = null;
+          if (sel && doc) {
+            const el = doc.querySelector(sel);
+            selectorExists = !!el;
+            if (el) selectorText = (el.textContent || "").replace(/\s+/g, " ").trim();
+          }
+          return { selectorExists, selectorText };
+        }, a.assertSelector ?? null),
+        ASSERT_EVAL_TIMEOUT_MS,
+        `page.evaluate timed out after ${ASSERT_EVAL_TIMEOUT_MS / 1000}s`,
+      );
+    } catch (e) {
+      const reason = firstLine((e as Error).message) || "evaluate failed";
+      // If something else already failed definitively, the failure stands;
+      // otherwise this claim is UNVERIFIED — never a silent pass.
+      if (failed) {
+        observed.push(`selector could not be evaluated (${reason})`);
+        return { status: "failed", expected: expected.join("; "), observed: observed.join("; ") };
+      }
+      return { status: "unverified", expected: expected.join("; "), observed: reason };
+    }
     if (probe.selectorExists) {
       observed.push("selector present");
     } else {
       observed.push("selector NOT found");
-      passed = false;
+      failed = true;
+    }
+    if (a.assertText) {
+      const ref = probe.selectorText ?? "";
+      observed.push(`text ${JSON.stringify(ref.slice(0, 200))}`);
+      if (!ref.includes(a.assertText)) failed = true;
     }
   }
-  if (a.assertText) {
-    // Text is read from assertSelector's element (the caller guarantees one).
-    const ref = probe.selectorText ?? "";
-    expected.push(`text contains ${JSON.stringify(a.assertText)}`);
-    observed.push(`text ${JSON.stringify(ref.slice(0, 200))}`);
-    if (!ref.includes(a.assertText)) passed = false;
+
+  return { status: failed ? "failed" : "passed", expected: expected.join("; "), observed: observed.join("; ") };
+}
+
+/** Apply a mark to the session: strict assertText/assertSelector contract,
+ *  evaluate assertions, annotate the mark so pass/fail/unverified is explicit,
+ *  update the tally, and abort the session on a FAILED assert under failMode
+ *  'abort'. Shared by the add_marker tool and the in-page CDP bridge. Throws on
+ *  the assertText-without-assertSelector contract violation (so a CDP driver
+ *  sees the rejection). */
+async function applyMark(
+  session: McpRecordingSession,
+  text: string,
+  opts: {
+    atSeconds?: number;
+    assertSelector?: string;
+    assertText?: string;
+    assertUrl?: string;
+    failMode?: "warn" | "abort";
+  },
+): Promise<{ note: NarrationNote; assertion: AssertOutcome | null; aborted: boolean }> {
+  if (opts.assertText && !opts.assertSelector) {
+    throw new Error(
+      "assertText requires assertSelector — name the element whose text you're checking. A bare page-body text match is weak evidence, so it's rejected (same rule as the CLI's --assert-text / --assert-selector).",
+    );
   }
-  if (a.assertUrl) {
-    expected.push(`url matches ${JSON.stringify(a.assertUrl)}`);
-    observed.push(`url ${JSON.stringify(url)}`);
-    if (!globMatch(url, a.assertUrl)) passed = false;
+  const hasAssertion = !!(opts.assertSelector || opts.assertText || opts.assertUrl);
+  let markText = text.trim();
+  let assertion: AssertOutcome | null = null;
+  if (hasAssertion) {
+    try {
+      assertion = await runMarkerAssertions(session.page, {
+        assertSelector: opts.assertSelector,
+        assertText: opts.assertText,
+        assertUrl: opts.assertUrl,
+      });
+    } catch (e) {
+      // Defensive: runMarkerAssertions swallows evaluate errors, but if anything
+      // else throws, the claim is unverified — never a silent pass.
+      assertion = { status: "unverified", expected: "assertion", observed: firstLine((e as Error).message) || "evaluation failed" };
+    }
+    if (assertion.status === "passed") {
+      session.assertPassed += 1;
+      markText = `${markText} [assert ✓ ${assertion.observed}]`;
+    } else if (assertion.status === "failed") {
+      session.assertFailed += 1;
+      markText = `${markText} [ASSERT ✗ expected ${assertion.expected}; observed ${assertion.observed}]`;
+    } else {
+      session.assertUnverified += 1;
+      markText = `${markText} [ASSERT ⚠ could not evaluate — ${assertion.observed}]`;
+    }
   }
-  return { passed, expected: expected.join("; "), observed: observed.join("; ") };
+  const note = sessionMark(session, markText, opts.atSeconds != null ? opts.atSeconds * 1000 : undefined);
+
+  // failMode 'abort' discards the session ONLY on a definitive failure — never
+  // on an unverified claim (inability to check must not nuke the recording).
+  let aborted = false;
+  if (assertion && assertion.status === "failed" && opts.failMode === "abort") {
+    await finishSession(session, "abort").catch(() => {});
+    aborted = true;
+  }
+  return { note, assertion, aborted };
+}
+
+/** Coerce a bridge-supplied (untrusted) options object into typed mark opts. */
+function coerceMarkOpts(raw: unknown): {
+  assertSelector?: string;
+  assertText?: string;
+  assertUrl?: string;
+  failMode?: "warn" | "abort";
+} {
+  const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" && v.trim() ? v : undefined);
+  const failMode = o.failMode === "abort" ? "abort" : o.failMode === "warn" ? "warn" : undefined;
+  return {
+    assertSelector: str(o.assertSelector),
+    assertText: str(o.assertText),
+    assertUrl: str(o.assertUrl),
+    failMode,
+  };
 }
 
 server.tool(
@@ -1830,28 +2094,15 @@ server.tool(
       );
     }
     const session = activeSession;
-    const hasAssertion = !!(assertSelector || assertText || assertUrl);
-    let markText = text.trim();
-    let assertion: AssertOutcome | null = null;
-    if (hasAssertion) {
-      try {
-        assertion = await runMarkerAssertions(session.page, { assertSelector, assertText, assertUrl });
-      } catch (e) {
-        return fail(`assertion evaluation failed: ${(e as Error).message}`);
-      }
-      if (assertion.passed) {
-        session.assertPassed += 1;
-        markText = `${markText} [assert ✓ ${assertion.observed}]`;
-      } else {
-        session.assertFailed += 1;
-        markText = `${markText} [ASSERT ✗ expected ${assertion.expected}; observed ${assertion.observed}]`;
-      }
-    }
-    const note = sessionMark(session, markText, atSeconds != null ? atSeconds * 1000 : undefined);
+    const { note, assertion, aborted } = await applyMark(session, text, {
+      atSeconds,
+      assertSelector,
+      assertText,
+      assertUrl,
+      failMode,
+    });
 
-    // failMode 'abort' on a failed assertion: discard the whole session.
-    if (assertion && !assertion.passed && failMode === "abort") {
-      await finishSession(session, "abort").catch(() => {});
+    if (aborted && assertion) {
       return ok({
         aborted: true,
         assertionFailed: true,
@@ -1866,7 +2117,11 @@ server.tool(
     return ok({
       atSeconds: Math.round(note.startMs / 100) / 10,
       text: note.text,
-      ...(assertion ? { assertion: { passed: assertion.passed, observed: assertion.observed } } : {}),
+      ...(assertion
+        ? assertion.status === "unverified"
+          ? { assertion: { verified: false, unverified: true, observed: assertion.observed }, unverified: true }
+          : { assertion: { passed: assertion.status === "passed", observed: assertion.observed } }
+        : {}),
       totalMarkers: session.marks.length,
     });
   },
