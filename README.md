@@ -2,20 +2,20 @@
 
 Give your AI agent access to your [Clipy](https://clipy.online) screen recordings.
 
+> This repository is the public mirror of **`@clipy/mcp`** (MIT). The package is developed
+> in the Clipy monorepo and synced here with each npm release, so this is the place to
+> browse the source and file issues. The published package lives on npm as
+> [`@clipy/mcp`](https://www.npmjs.com/package/@clipy/mcp).
+
 This is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server. It lets
 Claude, Cursor, Windsurf, and other MCP-capable agents **search your recordings and read
-their transcripts, AI summaries, and key moments** — including the video frames of
-exactly what the speaker pointed at, delivered as inline images your agent can see. So
-you can do things like _"read this bug-report recording and ship the fix"_ without
-leaving your agent.
+their transcripts and AI summaries** — so you can do things like _"turn this bug-report
+recording into a Linear ticket"_ without leaving your agent — and, with the `record`
+tool, **record a web app headlessly** and get it back as a Clipy recording (_"build the
+feature, then record the outcome"_).
 
-> **Zero-setup alternative:** every public Clipy share link is also agent-readable
-> without this server — append `.md` (e.g. `clipy.online/video/<id>.md`) and any agent
-> that can fetch a URL gets the summary, key moments with frames, and timestamped
-> transcript. The MCP server adds private-library search, inline frame images, and
-> one-call context bundles. More at [clipy.online/for-agents](https://clipy.online/for-agents).
-
-It is **read-only**: it can never create, edit, or delete your recordings.
+Every tool except `record` is **read-only**. `record` is the only one that creates a
+recording, and only when your key carries the `ingest` scope.
 
 ## Setup
 
@@ -78,9 +78,32 @@ or the Windsurf MCP config) directly:
 | `get_summary` | The AI summary: TL;DR, key points, action items. |
 | `wait_for_artifacts` | Poll until a recording's transcript/summary finish processing. |
 | `download_recording` | Download the MP4 locally so you can clip it or extract frames yourself (e.g. with ffmpeg). |
+| `get_key_moments` | Key moments: timestamps, captions, and click coordinates. |
+| `get_agent_context` | The full agent-context bundle (summary + key moments + transcript) as markdown. |
+| `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
+| `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
+| `add_marker` | Drop a live-timestamped narration marker into the active session — markers become the recording's transcript chapters. Navigations + console errors are added automatically as `[auto]` marks. |
+| `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
+| `abort_recording` | Discard the active session; nothing is uploaded. |
 
-All tools accept a recording's **public id** (the slug in its share URL) or the full
+Read tools accept a recording's **public id** (the slug in its share URL) or the full
 `https://clipy.online/video/<id>` URL.
+
+### Using `record`
+
+`record` opens a URL in a headless Chromium (works in CI / cloud sandboxes, no display),
+records for a few seconds, and streams it into Clipy — then returns the id so you can call
+`wait_for_artifacts` and `get_agent_context` to read it back. It needs:
+
+1. **Playwright** in the environment running this MCP server:
+   ```bash
+   npm install -g playwright && npx playwright install chromium
+   ```
+2. An API key with the **"Record & upload" (ingest)** permission — choose it when you mint
+   the key at [clipy.online/settings/api-keys](https://clipy.online/settings/api-keys).
+
+Parameters: `url` (required, http/https), `durationSeconds` (default 15, max 300), `name`,
+`width`/`height` (default 1280×720).
 
 ## Config
 

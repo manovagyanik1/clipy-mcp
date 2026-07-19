@@ -2,15 +2,17 @@
 /**
  * @clipy/mcp — Model Context Protocol server for Clipy.
  *
- * Gives an AI agent (Claude Desktop/Code, Cursor, Windsurf, …) read access to
- * the signed-in user's Clipy screen recordings: search the library, and read
- * any recording's transcript and AI summary. The headline use case is turning a
- * bug-report recording into a ticket — the agent reads the transcript + summary
- * and drafts the issue.
+ * Gives an AI agent (Claude Desktop/Code, Cursor, Windsurf, …) access to the
+ * signed-in user's Clipy screen recordings: search the library, read any
+ * recording's transcript and AI summary, and — with an `ingest`-scoped key —
+ * RECORD a web app headlessly and get it back as a Clipy recording. The
+ * headline read use case is turning a bug-report recording into a ticket; the
+ * headline write use case is "build a feature, then record the outcome."
  *
  * Auth: a personal API key (`CLIPY_API_KEY`, looks like `clipy_sk_live_…`),
- * minted at https://clipy.online/settings/api-keys. The server is read-only;
- * it can never create, modify, or delete recordings.
+ * minted at https://clipy.online/settings/api-keys. Read tools need any key;
+ * the `record` tool additionally needs the key to carry the `ingest` scope
+ * ("Record & upload"). Everything except `record` is read-only.
  *
  * Config (env):
  *   CLIPY_API_KEY   (required)  your personal key
@@ -20,7 +22,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { createWriteStream, statSync } from "node:fs";
+import { closeSync, createWriteStream, mkdirSync, openSync, readSync, rmSync, statSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Readable } from "node:stream";
@@ -59,7 +62,7 @@ async function api(path: string): Promise<Json> {
       headers: {
         Authorization: `Bearer ${API_KEY}`,
         Accept: "application/json",
-        "User-Agent": "clipy-mcp/0.5.2",
+        "User-Agent": "clipy-mcp/0.7.0",
       },
       signal: controller.signal,
     });
@@ -87,6 +90,234 @@ async function api(path: string): Promise<Json> {
   return body;
 }
 
+// ---------------------------------------------------------------------------
+// Ingest (write) helpers — used only by the `record` tool. These POST to the
+// raw-upload pipeline with the API key (which must carry the `ingest` scope).
+// ---------------------------------------------------------------------------
+
+/** POST/PUT JSON to a write endpoint. Retries transient failures; throws on hard errors. */
+async function apiPostJson(path: string, payload: unknown, method: "POST" | "PUT" = "POST"): Promise<Json> {
+  if (!API_KEY) throw new Error(`Missing CLIPY_API_KEY. Create one at ${API_URL}/settings/api-keys.`);
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${API_URL}${path}`, {
+        method,
+        headers: {
+          Authorization: `Bearer ${API_KEY}`,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": "clipy-mcp/0.7.0",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (attempt < 4) {
+        await sleep(attempt * 1000);
+        continue;
+      }
+      throw new Error((e as Error).name === "AbortError" ? `request timed out (${path})` : (e as Error).message);
+    } finally {
+      clearTimeout(timer);
+    }
+    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+      await sleep(attempt * 1000);
+      continue;
+    }
+    const text = await res.text();
+    let body: Json = {};
+    try {
+      body = text ? (JSON.parse(text) as Json) : {};
+    } catch {
+      body = { raw: text };
+    }
+    if (!res.ok) {
+      const msg = (typeof body.error === "string" && body.error) || `Clipy API error ${res.status}`;
+      if (res.status === 403) {
+        throw new Error(
+          `${msg}\nThe record tool needs an API key with the "ingest" permission. ` +
+            `Mint one at ${API_URL}/settings/api-keys (check "Record & upload").`,
+        );
+      }
+      throw new Error(msg);
+    }
+    return body;
+  }
+  throw new Error(`request failed after retries (${path})`);
+}
+
+/** Upload one raw-upload chunk as multipart/form-data, retrying transient 429/5xx. */
+async function apiPostChunk(
+  recordingId: string,
+  uploadToken: string,
+  partNumber: number,
+  bytes: Uint8Array,
+): Promise<void> {
+  if (!API_KEY) throw new Error("Missing CLIPY_API_KEY.");
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    const part = bytes.slice().buffer as ArrayBuffer;
+    const form = new FormData();
+    form.append("recordingId", recordingId);
+    form.append("uploadToken", uploadToken);
+    form.append("partNumber", String(partNumber));
+    form.append("file", new Blob([part], { type: "video/webm" }), `part-${partNumber}.webm`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 120_000);
+    let res: Response;
+    try {
+      res = await fetch(`${API_URL}/api/videos/raw-upload/chunk`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${API_KEY}`, "User-Agent": "clipy-mcp/0.7.0" },
+        body: form,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      if (attempt === 4) throw e;
+      await sleep(attempt * 1000);
+      continue;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (res.ok) return;
+    if ((res.status === 429 || res.status >= 500) && attempt < 4) {
+      await sleep(attempt * 1000);
+      continue;
+    }
+    const text = await res.text().catch(() => "");
+    throw new Error(`chunk ${partNumber} failed (HTTP ${res.status})${text ? `: ${text}` : ""}`);
+  }
+}
+
+// Minimal structural type for the slice of Playwright we use — declared here so
+// the server typechecks without Playwright installed (it's a lazy runtime
+// import, never a dependency of the base server).
+interface PwPage {
+  goto(url: string, opts?: { waitUntil?: string; timeout?: number }): Promise<unknown>;
+  waitForTimeout(ms: number): Promise<void>;
+  video(): { path(): Promise<string> } | null;
+  close(): Promise<void>;
+  on(event: string, handler: (arg: never) => void): unknown;
+}
+interface PwContext {
+  newPage(): Promise<PwPage>;
+  close(): Promise<void>;
+}
+interface PwBrowser {
+  newContext(opts: Record<string, unknown>): Promise<PwContext>;
+  close(): Promise<void>;
+}
+interface PwChromium {
+  launch(opts: Record<string, unknown>): Promise<PwBrowser>;
+}
+
+async function loadChromium(): Promise<PwChromium> {
+  for (const mod of ["playwright", "playwright-core"]) {
+    try {
+      const pw = (await import(mod)) as { chromium?: PwChromium };
+      if (pw.chromium) return pw.chromium;
+    } catch {
+      // try the next module
+    }
+  }
+  throw new Error(
+    "The record tool needs Playwright (a headless browser). Install it in the environment " +
+      "running this MCP server:  npm install -g playwright && npx playwright install chromium",
+  );
+}
+
+/** Timestamped narration note ("mark"). For silent headless captures these
+ *  become the recording's transcript server-side (model='agent-narration'). */
+interface NarrationNote {
+  startMs: number;
+  endMs?: number;
+  text: string;
+}
+
+/** WebM files start with the EBML magic; refuse to upload corrupt captures. */
+function validateWebmFile(videoPath: string): number {
+  const size = statSync(videoPath).size;
+  if (size === 0) throw new Error("recording produced an empty file");
+  const fd = openSync(videoPath, "r");
+  try {
+    const head = Buffer.alloc(4);
+    readSync(fd, head, 0, 4, 0);
+    if (!(head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3)) {
+      throw new Error("recording file is not valid WebM (corrupt capture?)");
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return size;
+}
+
+/**
+ * Streams a captured WebM through the raw-upload pipeline
+ * (initiate → chunks → finalize → complete). Shared by the one-shot `record`
+ * tool and the session tools. Aborts the server-side session on failure.
+ */
+async function uploadCapturedWebm(opts: {
+  videoPath: string;
+  name?: string;
+  description?: string;
+  narration?: { text?: string; notes?: NarrationNote[] };
+}): Promise<{ publicId: string; sizeBytes: number }> {
+  const sizeBytes = validateWebmFile(opts.videoPath);
+  const recordingId = randomUUID();
+  let uploadToken = "";
+  let publicId = "";
+  try {
+    const init = await apiPostJson("/api/videos/raw-upload/initiate", {
+      recordingId,
+      createVideoRow: true,
+      sourcePlatform: "web",
+      sourceVersion: "mcp/0.7.0",
+    });
+    uploadToken = String(init.uploadToken ?? "");
+    publicId = String(init.publicId ?? "");
+    if (!uploadToken) throw new Error("initiate did not return an uploadToken");
+
+    const PART_SIZE = 4 * 1024 * 1024;
+    const fd = openSync(opts.videoPath, "r");
+    try {
+      const buffer = Buffer.allocUnsafe(PART_SIZE);
+      let partNumber = 1;
+      let offset = 0;
+      while (offset < sizeBytes) {
+        const bytesRead = readSync(fd, buffer, 0, PART_SIZE, offset);
+        if (bytesRead <= 0) break;
+        await apiPostChunk(recordingId, uploadToken, partNumber, buffer.subarray(0, bytesRead));
+        offset += bytesRead;
+        partNumber++;
+      }
+    } finally {
+      closeSync(fd);
+    }
+
+    await apiPostJson("/api/videos/raw-upload/finalize", { recordingId, uploadToken });
+    await apiPostJson("/api/videos/raw-upload/complete", {
+      recordingId,
+      uploadToken,
+      name: opts.name,
+      description: opts.description,
+      sourcePlatform: "web",
+      sourceVersion: "mcp/0.7.0",
+      ...(opts.narration && (opts.narration.text || opts.narration.notes?.length)
+        ? { narration: opts.narration }
+        : {}),
+    });
+    uploadToken = ""; // completed — nothing to abort
+  } catch (e) {
+    if (uploadToken) {
+      await apiPostJson("/api/videos/raw-upload/abort", { recordingId, uploadToken }).catch(() => {});
+    }
+    throw e;
+  }
+  return { publicId, sizeBytes };
+}
+
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
@@ -100,7 +331,7 @@ function fail(message: string) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-const server = new McpServer({ name: "clipy", version: "0.5.2" });
+const server = new McpServer({ name: "clipy", version: "0.7.0" });
 
 const recordingIdSchema = z
   .string()
@@ -405,6 +636,15 @@ interface KeyMomentDto {
   x: number | null;
   y: number | null;
   confidence: number;
+  motion?: {
+    relation?: "move" | "drag" | null;
+    targetTMs?: number | null;
+    targetTimeLabel?: string | null;
+    targetX?: number | null;
+    targetY?: number | null;
+    targetFrameUrl?: string | null;
+    confidence?: number | null;
+  } | null;
 }
 
 function momentText(m: KeyMomentDto): string {
@@ -412,10 +652,14 @@ function momentText(m: KeyMomentDto): string {
     m.x != null && m.y != null
       ? ` (click at ${(m.x * 100).toFixed(1)}% left, ${(m.y * 100).toFixed(1)}% top — marked on the frame)`
       : "";
+  const motion =
+    m.motion?.targetX != null && m.motion.targetY != null
+      ? `; ${m.motion.relation === "drag" ? "drag" : "move"} target at ${(m.motion.targetX * 100).toFixed(1)}% left, ${(m.motion.targetY * 100).toFixed(1)}% top${m.motion.targetFrameUrl ? " — destination frame attached" : ""}`
+      : "";
   // source: 'fused' = caption matched to a real recorded click; 'hover' =
   // cursor position while speaking; 'click' = a click with no narration;
   // 'deixis' = spoken reference only, no coordinates.
-  return `${m.timeLabel} — ${m.caption}${coord} [${m.source}, confidence ${m.confidence}]`;
+  return `${m.timeLabel} — ${m.caption}${coord}${motion} [${m.source}, confidence ${m.confidence}]`;
 }
 
 function telemetryLine(cursorTelemetry: unknown): string {
@@ -451,6 +695,17 @@ async function attachMomentImages(
         text: `Full-resolution crop around the pointer at ${m.timeLabel} — read the exact UI label here:`,
       });
       content.push(crop);
+      attached += 1;
+    }
+  }
+  if (m.motion?.targetFrameUrl) {
+    const target = await frameToImageBlock(m.motion.targetFrameUrl);
+    if (target) {
+      content.push({
+        type: "text",
+        text: `Destination frame for ${m.motion.relation === "drag" ? "drag" : "move"} target at ${m.motion.targetTimeLabel ?? m.timeLabel}:`,
+      });
+      content.push(target);
       attached += 1;
     }
   }
@@ -649,6 +904,456 @@ server.tool(
         text: `## Transcript\n${transcriptText ? transcriptText.slice(0, 50_000) : "(no transcript)"}${transcriptText.length > 50_000 ? "\n[truncated — get_transcript returns the rest]" : ""}`,
       });
       return { content };
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "record",
+  "Record a web app HEADLESSLY and upload it as a Clipy recording, then return its share link + agent-context URL. Use this to capture the outcome of work you just did — e.g. after building a feature, record the running app so it can be shared or read back. Opens the given URL in a headless Chromium (works in cloud sandboxes, no display needed), records for `durationSeconds`, and streams the video into Clipy's pipeline. Requires (1) Playwright installed in this MCP server's environment (`npm i -g playwright && npx playwright install chromium`) and (2) the CLIPY_API_KEY to carry the 'ingest' scope. After it returns, call wait_for_artifacts then get_agent_context to read the transcript/summary.",
+  {
+    url: z.string().describe("The http(s) URL to open and record (e.g. http://localhost:3000)."),
+    durationSeconds: z
+      .number()
+      .int()
+      .min(2)
+      .max(300)
+      .optional()
+      .describe("How long to record after the page loads (default 15, max 300)."),
+    name: z.string().optional().describe("Optional title for the recording."),
+    description: z.string().optional().describe("Optional description for the recording."),
+    notes: z
+      .array(
+        z.object({
+          atSeconds: z.number().min(0).describe("Position on the video timeline, in seconds."),
+          text: z.string().min(1).max(1000).describe("What is happening at that moment."),
+        }),
+      )
+      .max(200)
+      .optional()
+      .describe(
+        "Timestamped narration notes describing what the recording shows. Headless captures are silent, so these notes BECOME the recording's transcript — write them like chapters ('0s: homepage loads', '8s: the new export button appears').",
+      ),
+    width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280)."),
+    height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720)."),
+  },
+  async ({ url, durationSeconds, name, description, notes, width, height }) => {
+    // Validate the URL before spinning up a browser.
+    let target: URL;
+    try {
+      target = new URL(url);
+    } catch {
+      return fail(`invalid url: ${url}`);
+    }
+    if (target.protocol !== "http:" && target.protocol !== "https:") {
+      return fail(`url must be http(s), got ${target.protocol}`);
+    }
+    if (!API_KEY) {
+      return fail(`Missing CLIPY_API_KEY. Create an ingest-scoped key at ${API_URL}/settings/api-keys.`);
+    }
+
+    const w = width ?? 1280;
+    const h = height ?? 720;
+    const forSec = durationSeconds ?? 15;
+    const recordingId = randomUUID();
+    const dir = join(tmpdir(), `clipy-mcp-record-${recordingId}`);
+
+    let chromium: PwChromium;
+    try {
+      chromium = await loadChromium();
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+    mkdirSync(dir, { recursive: true });
+
+    let publicId = "";
+    let sizeBytes = 0;
+    try {
+      // ── Capture ──
+      let videoPath: string;
+      const browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      });
+      try {
+        const context = await browser.newContext({
+          viewport: { width: w, height: h },
+          recordVideo: { dir, size: { width: w, height: h } },
+        });
+        const page = await context.newPage();
+        try {
+          await page.goto(target.href, { waitUntil: "load", timeout: 30_000 });
+        } catch {
+          // slow SPA may not fire 'load' — record current state anyway
+        }
+        await page.waitForTimeout(forSec * 1000);
+        const video = page.video();
+        await page.close();
+        await context.close();
+        if (!video) throw new Error("browser did not produce a video");
+        videoPath = await video.path();
+      } finally {
+        await browser.close().catch(() => {});
+      }
+
+      // ── Upload through the same pipeline the web/desktop clients use ──
+      const uploaded = await uploadCapturedWebm({
+        videoPath,
+        name,
+        description,
+        narration: notes?.length
+          ? {
+              notes: notes.map((n) => ({
+                startMs: Math.round(n.atSeconds * 1000),
+                text: n.text.trim(),
+              })),
+            }
+          : undefined,
+      });
+      publicId = uploaded.publicId;
+      sizeBytes = uploaded.sizeBytes;
+    } catch (e) {
+      return fail((e as Error).message);
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // best-effort temp cleanup
+      }
+    }
+
+    return ok({
+      id: publicId,
+      shareUrl: `${API_URL}/video/${publicId}`,
+      agentContextUrl: `${API_URL}/api/agent-context/${publicId}`,
+      sizeBytes,
+      recordedSeconds: forSec,
+      next: "Processing runs in the background. Call wait_for_artifacts with this id (require:'all'), then get_agent_context / get_transcript to read it.",
+    });
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Session tools — "you work, Clipy records." start_recording opens a headless
+// browser THAT KEEPS RECORDING while you do other things (drive the page with
+// your own browser tools, run commands, …). add_marker drops live-timestamped
+// notes; stop_recording closes + uploads, and your markers become the
+// recording's transcript. The session lives inside this MCP server process.
+//
+// Safety rails, enforced here rather than by prompt discipline: a mandatory
+// max duration (default 600s, hard cap 1800s) auto-stops AND UPLOADS the
+// partial capture; abort discards everything; one session per server.
+// ---------------------------------------------------------------------------
+
+const SESSION_DEFAULT_MAX_SEC = 600;
+const SESSION_HARD_CAP_SEC = 1800;
+
+interface McpRecordingSession {
+  browser: PwBrowser;
+  context: PwContext;
+  page: PwPage;
+  tmpDir: string;
+  url: string;
+  name?: string;
+  description?: string;
+  maxSec: number;
+  recordStartEpochMs: number;
+  marks: NarrationNote[];
+  maxTimer: ReturnType<typeof setTimeout>;
+  /** Memoized finish so stop / auto-stop / abort can't race each other. */
+  finishing: Promise<Json> | null;
+}
+
+let activeSession: McpRecordingSession | null = null;
+/** Result of a max-duration auto-stop, held for the next stop_recording call. */
+let autoStoppedResult: Json | null = null;
+
+function sessionMark(session: McpRecordingSession, text: string): NarrationNote {
+  const note: NarrationNote = {
+    startMs: Math.max(0, Date.now() - session.recordStartEpochMs),
+    text,
+  };
+  if (session.marks.length < 500) session.marks.push(note);
+  return note;
+}
+
+/** Close the browser, upload the capture (unless aborting), clean up. */
+function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Promise<Json> {
+  if (session.finishing) return session.finishing;
+  session.finishing = (async () => {
+    clearTimeout(session.maxTimer);
+    try {
+      const video = session.page.video();
+      await session.page.close().catch(() => {});
+      await session.context.close().catch(() => {});
+      if (mode === "abort") {
+        return { aborted: true } as Json;
+      }
+      if (!video) throw new Error("browser did not produce a video");
+      const videoPath = await video.path();
+      await session.browser.close().catch(() => {});
+      const notes = [...session.marks].sort((a, b) => a.startMs - b.startMs);
+      const uploaded = await uploadCapturedWebm({
+        videoPath,
+        name: session.name,
+        description: session.description,
+        narration: notes.length ? { notes } : undefined,
+      });
+      return {
+        id: uploaded.publicId,
+        shareUrl: `${API_URL}/video/${uploaded.publicId}`,
+        agentContextUrl: `${API_URL}/api/agent-context/${uploaded.publicId}`,
+        sizeBytes: uploaded.sizeBytes,
+        markers: notes.length,
+        next: "Processing runs in the background. Call wait_for_artifacts with this id, then get_agent_context to verify the recording before sharing the link.",
+      } as Json;
+    } finally {
+      await session.browser.close().catch(() => {});
+      try {
+        rmSync(session.tmpDir, { recursive: true, force: true });
+      } catch {
+        // best-effort temp cleanup
+      }
+      if (activeSession === session) activeSession = null;
+    }
+  })();
+  return session.finishing;
+}
+
+server.tool(
+  "start_recording",
+  "Start a RECORDING SESSION: opens the given URL in a headless Chromium that keeps recording in the background while you continue working. Use add_marker to narrate what you're doing at each step (markers become the recording's transcript), then stop_recording to upload and get the share link. The session auto-stops and uploads by itself at maxSeconds (default 600) so a forgotten session can never run away. One session at a time. Requires Playwright + an ingest-scoped CLIPY_API_KEY (like the record tool).",
+  {
+    url: z.string().describe("The http(s) URL to open and record (e.g. http://localhost:3000)."),
+    name: z.string().optional().describe("Optional title for the recording."),
+    description: z.string().optional().describe("Optional description for the recording."),
+    maxSeconds: z
+      .number()
+      .int()
+      .min(5)
+      .max(SESSION_HARD_CAP_SEC)
+      .optional()
+      .describe(
+        `Auto-stop ceiling in seconds (default ${SESSION_DEFAULT_MAX_SEC}, hard cap ${SESSION_HARD_CAP_SEC}). On expiry the session uploads what it captured.`,
+      ),
+    width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280)."),
+    height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720)."),
+  },
+  async ({ url, name, description, maxSeconds, width, height }) => {
+    let target: URL;
+    try {
+      target = new URL(url);
+    } catch {
+      return fail(`invalid url: ${url}`);
+    }
+    if (target.protocol !== "http:" && target.protocol !== "https:") {
+      return fail(`url must be http(s), got ${target.protocol}`);
+    }
+    if (!API_KEY) {
+      return fail(`Missing CLIPY_API_KEY. Create an ingest-scoped key at ${API_URL}/settings/api-keys.`);
+    }
+    if (activeSession) {
+      return fail(
+        "a recording session is already active — finish it with stop_recording or discard it with abort_recording first.",
+      );
+    }
+
+    let chromium: PwChromium;
+    try {
+      chromium = await loadChromium();
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+
+    const w = width ?? 1280;
+    const h = height ?? 720;
+    const maxSec = Math.min(maxSeconds ?? SESSION_DEFAULT_MAX_SEC, SESSION_HARD_CAP_SEC);
+    const tmpDirPath = join(tmpdir(), `clipy-mcp-session-${randomUUID()}`);
+    mkdirSync(tmpDirPath, { recursive: true });
+
+    try {
+      const browser = await chromium.launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-dev-shm-usage"],
+      });
+      const context = await browser.newContext({
+        viewport: { width: w, height: h },
+        recordVideo: { dir: tmpDirPath, size: { width: w, height: h } },
+      });
+      const page = await context.newPage();
+
+      const session: McpRecordingSession = {
+        browser,
+        context,
+        page,
+        tmpDir: tmpDirPath,
+        url: target.href,
+        name,
+        description,
+        maxSec,
+        recordStartEpochMs: Date.now(),
+        marks: [],
+        maxTimer: setTimeout(() => {}, 0),
+        finishing: null,
+      };
+      clearTimeout(session.maxTimer);
+      session.maxTimer = setTimeout(() => {
+        // Auto-stop rail: upload the partial rather than record forever.
+        sessionMark(session, `[auto] session auto-stopped at the ${maxSec}s max duration`);
+        finishSession(session, "stop")
+          .then((result) => {
+            autoStoppedResult = result;
+          })
+          .catch(() => {});
+      }, maxSec * 1000);
+
+      // [auto] instrumentation marks alongside the agent's intent markers.
+      page.on("framenavigated", ((frame: { url(): string; parentFrame(): unknown }) => {
+        try {
+          if (frame.parentFrame() === null) {
+            sessionMark(session, `[auto] navigated to ${frame.url()}`);
+          }
+        } catch {
+          // never let instrumentation kill the recording
+        }
+      }) as never);
+      page.on("console", ((msg: { type(): string; text(): string }) => {
+        try {
+          if (msg.type() === "error") {
+            sessionMark(session, `[auto] console error: ${msg.text().slice(0, 200)}`);
+          }
+        } catch {
+          // ignore
+        }
+      }) as never);
+
+      activeSession = session;
+      autoStoppedResult = null;
+      page
+        .goto(target.href, { waitUntil: "load", timeout: 30_000 })
+        .catch(() => {
+          // slow SPA — the recording is running regardless
+        });
+
+      return ok({
+        state: "recording",
+        url: target.href,
+        maxSeconds: maxSec,
+        next: "The session is recording. Use add_marker to narrate each step as you work; call stop_recording when done (or abort_recording to discard). It auto-stops + uploads at the max duration.",
+      });
+    } catch (e) {
+      try {
+        rmSync(tmpDirPath, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "add_marker",
+  "Drop a live-timestamped narration marker into the active recording session ('reproduced the bug', 'the fix renders correctly at mobile width'). Markers become the recording's transcript chapters, so narrate as you work — they are how the recording stays agent-readable despite having no audio.",
+  {
+    text: z.string().min(1).max(1000).describe("What is happening right now."),
+  },
+  async ({ text }) => {
+    if (!activeSession || activeSession.finishing) {
+      return fail("no active recording session — call start_recording first.");
+    }
+    const note = sessionMark(activeSession, text.trim());
+    return ok({
+      atSeconds: Math.round(note.startMs / 100) / 10,
+      text: note.text,
+      totalMarkers: activeSession.marks.length,
+    });
+  },
+);
+
+server.tool(
+  "stop_recording",
+  "Finish the active recording session: closes the browser, uploads the capture, and returns the share link + agent-context URL. Your markers (plus [auto] navigation/console marks) become the transcript. If the session already auto-stopped at its max duration, returns that upload's result.",
+  {},
+  async () => {
+    if (activeSession) {
+      try {
+        return ok(await finishSession(activeSession, "stop"));
+      } catch (e) {
+        return fail((e as Error).message);
+      }
+    }
+    if (autoStoppedResult) {
+      const result = autoStoppedResult;
+      autoStoppedResult = null;
+      return ok({ ...result, note: "The session had already auto-stopped at its max duration; this is that upload." });
+    }
+    return fail("no active recording session — call start_recording first.");
+  },
+);
+
+server.tool(
+  "replace_transcript",
+  "REPLACE a recording's transcript with content you author (needs the 'ingest' scope). Use it to fix a bad speech-to-text pass, translate, or enrich a silent agent capture after upload. The summary regenerates from the new text automatically. Provenance is explicit: the transcript is marked as agent-edited, never passed off as speech-to-text.",
+  {
+    id: recordingIdSchema,
+    segments: z
+      .array(
+        z.object({
+          start: z.number().min(0).describe("Segment start in seconds."),
+          end: z.number().min(0).describe("Segment end in seconds (>= start)."),
+          text: z.string().min(1).max(2000),
+        }),
+      )
+      .max(5000)
+      .optional()
+      .describe("Timestamped segments. Provide this OR plaintext."),
+    plaintext: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Whole transcript as one text block (stored as a single segment)."),
+    language: z.string().optional().describe("BCP-47-ish language tag, default 'en'."),
+  },
+  async ({ id, segments, plaintext, language }) => {
+    if (!segments?.length && !plaintext?.trim()) {
+      return fail("provide segments or plaintext");
+    }
+    try {
+      const pid = encodeURIComponent(normalizeId(id));
+      const result = await apiPostJson(
+        `/api/v1/recordings/${pid}/transcript`,
+        { segments, plaintext, language },
+        "PUT",
+      );
+      return ok(result);
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "abort_recording",
+  "Discard the active recording session: closes the browser and deletes the capture. Nothing is uploaded. Use this when the session captured the wrong thing or an error made it worthless.",
+  {},
+  async () => {
+    if (!activeSession) {
+      if (autoStoppedResult) {
+        const result = autoStoppedResult;
+        autoStoppedResult = null;
+        return ok({
+          ...result,
+          note: "The session had already auto-stopped and uploaded before this abort; the recording exists (delete it from the library if unwanted).",
+        });
+      }
+      return fail("no active recording session.");
+    }
+    try {
+      await finishSession(activeSession, "abort");
+      return ok({ aborted: true, note: "Session discarded — nothing was uploaded." });
     } catch (e) {
       return fail((e as Error).message);
     }
