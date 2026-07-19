@@ -44,8 +44,8 @@ Call the `list_recordings` tool. A valid setup returns the user's recent recordi
 
 ## Notes
 
-- Read tools work with any key. The `record` and transcript-edit tools require a key
-  with the `ingest` scope (enforced server-side), so a read-only key can never create,
-  modify, or delete recordings.
+- Read tools need the default `recordings:read` scope. The `record` and transcript-edit
+  tools require a key with the `ingest` scope (enforced server-side), so a
+  `recordings:read`-only key can never create, modify, or delete recordings.
 - No other configuration is required. `CLIPY_API_URL` may optionally override the API
   base URL (defaults to `https://clipy.online`) — only needed for self-hosted setups.

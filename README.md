@@ -14,11 +14,12 @@ recording into a Linear ticket"_ without leaving your agent — and, with the `r
 tool, **record a web app headlessly** and get it back as a Clipy recording (_"build the
 feature, then record the outcome"_).
 
-The read tools work with any valid key. The write tools — `record`, the session tools
-(`start_recording`, `add_marker`, `stop_recording`, `abort_recording`), and
-`replace_transcript` — additionally need the key to carry the `ingest` scope
-("Record & upload"), which the server enforces. A read-only key can read your
-recordings but cannot create, modify, or delete anything.
+The read tools need the `recordings:read` scope, which every key gets by default. The
+write tools — `record`, the session tools (`start_recording`, `add_marker`,
+`stop_recording`, `abort_recording`), and `replace_transcript` — additionally need the
+key to carry the `ingest` scope ("Record & upload"), which the server enforces. A
+`recordings:read`-only key can read your recordings but cannot create, modify, or
+delete anything.
 
 ## Setup
 
