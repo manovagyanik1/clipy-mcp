@@ -14,8 +14,11 @@ recording into a Linear ticket"_ without leaving your agent — and, with the `r
 tool, **record a web app headlessly** and get it back as a Clipy recording (_"build the
 feature, then record the outcome"_).
 
-Every tool except `record` is **read-only**. `record` is the only one that creates a
-recording, and only when your key carries the `ingest` scope.
+The read tools work with any valid key. The write tools — `record`, the session tools
+(`start_recording`, `add_marker`, `stop_recording`, `abort_recording`), and
+`replace_transcript` — additionally need the key to carry the `ingest` scope
+("Record & upload"), which the server enforces. A read-only key can read your
+recordings but cannot create, modify, or delete anything.
 
 ## Setup
 
@@ -85,6 +88,7 @@ or the Windsurf MCP config) directly:
 | `add_marker` | Drop a live-timestamped narration marker into the active session — markers become the recording's transcript chapters. Navigations + console errors are added automatically as `[auto]` marks. |
 | `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
 | `abort_recording` | Discard the active session; nothing is uploaded. |
+| `replace_transcript` | **Replace a recording's transcript** with text you author (needs the `ingest` scope). Fix a bad speech-to-text pass, translate, or enrich a silent agent capture; the summary regenerates automatically. Marked as agent-edited, never passed off as speech-to-text. |
 
 Read tools accept a recording's **public id** (the slug in its share URL) or the full
 `https://clipy.online/video/<id>` URL.
