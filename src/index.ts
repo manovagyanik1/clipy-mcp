@@ -35,7 +35,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.4";
+const SERVER_VERSION = "0.8.5";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -206,6 +206,7 @@ interface PwPage {
   screenshot(opts?: { type?: string; quality?: number }): Promise<Buffer>;
   video(): { path(): Promise<string> } | null;
   url(): string;
+  title(): Promise<string>;
   evaluate<T, A>(fn: (arg: A) => T, arg: A): Promise<T>;
   close(): Promise<void>;
   on(event: string, handler: (arg: never) => void): unknown;
@@ -805,6 +806,57 @@ function profileCopyDisclosure(copy: ProfileCopy, userDataDir: string): Json {
         }
       : {}),
     ...(copy.skipped.length ? { skippedEntries: copy.skipped } : {}),
+  };
+}
+
+// --- Resolved capture source ------------------------------------------------
+// Field finding (0.8.5): a window capture whose driver was driving a BACKGROUND
+// TAB of that window produced perfectly truthful driver-attested marks over
+// footage of the wrong tab. Attested evidence proves what the DRIVER observed;
+// nothing tied it to what the CAMERA saw. The fix is to report the RESOLVED
+// capture source at start time so a caller can compare it against the surface it
+// is driving BEFORE doing minutes of work.
+//
+// REJECTED FIX — do not reopen: having the recorder foreground/activate the
+// target window or tab. That fails the any-driver gate and re-imports the
+// browser-ownership premise deliberately removed in 0.8.3. Clipy is a recorder;
+// it reports what the camera sees and never moves the camera for you.
+//
+// This server only ever captures a headless Chromium page it owns — the
+// window/display (mac-screen) path is CLI-only — so there is no window id or
+// window title to report here. Rather than emit a {kind,id,title} shell with
+// invented or empty values (exactly the false-identity failure this exists to
+// prevent), we report what IS true of a headless capture: the RESOLVED post-
+// redirect URL, the page title, and the recording viewport.
+
+/** Resolve what the camera is actually pointed at, read fresh at start time —
+ *  never a stale or caller-supplied value. */
+async function resolveHeadlessSource(
+  page: PwPage,
+  viewport: { width: number; height: number },
+): Promise<Json> {
+  let url = "";
+  try {
+    url = page.url();
+  } catch {
+    url = "";
+  }
+  let title = "";
+  try {
+    // Bounded: a wedged page must not hold up the tool result.
+    title = (await withTimeout(page.title(), 2_000, "title read timed out")).trim().slice(0, 200);
+  } catch {
+    title = "";
+  }
+  return {
+    kind: "headless_browser",
+    ...(title ? { title } : {}),
+    url,
+    viewport: { width: viewport.width, height: viewport.height },
+    note:
+      "This is the surface Clipy is recording. Compare it with what your driver is acting on — " +
+      "matching it is YOUR job: Clipy never focuses or foregrounds a window or tab. " +
+      "Window/display capture (a real app window) is CLI-only: clipy record --source mac-screen.",
   };
 }
 
@@ -1537,7 +1589,7 @@ server.tool(
 
 server.tool(
   "record",
-  "Record a web app HEADLESSLY and upload it as a Clipy recording, then return its share link + agent-context URL. Use this to capture the outcome of work you just did — e.g. after building a feature, record the running app so it can be shared or read back. Opens the given URL in a headless Chromium (works in cloud sandboxes, no display needed), records for `durationSeconds`, and streams the video into Clipy's pipeline. Set `type` so the summary reads the recording correctly, `viewports` to sweep multiple screen sizes into one video, and `storageState`/`initScript`/`userDataDir` to record behind a login. Requires (1) Playwright installed in this MCP server's environment (`npm i -g playwright && npx playwright install chromium`) and (2) the CLIPY_API_KEY to carry the 'ingest' scope. Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy record --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is a CLI-only convenience; `storageState` covers the same need here. Auth note: `storageState` seeds exactly what it contains (cookies + localStorage) but can't reproduce a whole browser identity (IndexedDB, service workers, some cross-origin auth); for those, produce a storageState via an interactive `npx playwright open --save-storage=state.json <login-url>` first, or use `userDataDir` pointed at a DEDICATED (never live) profile directory. After it returns, call wait_for_artifacts then get_agent_context to read the transcript/summary.",
+  "Record a web app HEADLESSLY and upload it as a Clipy recording, then return its share link + agent-context URL. Use this to capture the outcome of work you just did — e.g. after building a feature, record the running app so it can be shared or read back. Opens the given URL in a headless Chromium (works in cloud sandboxes, no display needed), records for `durationSeconds`, and streams the video into Clipy's pipeline. Set `type` so the summary reads the recording correctly, `viewports` to sweep multiple screen sizes into one video, and `storageState`/`initScript`/`userDataDir` to record behind a login. Requires (1) Playwright installed in this MCP server's environment (`npm i -g playwright && npx playwright install chromium`) and (2) the CLIPY_API_KEY to carry the 'ingest' scope. Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy record --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is a CLI-only convenience; `storageState` covers the same need here. The result reports the RESOLVED capture source (`source`: the post-redirect URL, page title and viewport actually being recorded) — compare it against the surface your driver is acting on BEFORE doing minutes of work, because Clipy will never focus or foreground a window or tab for you. Auth note: `storageState` seeds exactly what it contains (cookies + localStorage) but can't reproduce a whole browser identity (IndexedDB, service workers, some cross-origin auth); for those, produce a storageState via an interactive `npx playwright open --save-storage=state.json <login-url>` first, or use `userDataDir` pointed at a DEDICATED (never live) profile directory. After it returns, call wait_for_artifacts then get_agent_context to read the transcript/summary.",
   {
     url: z.string().describe("The http(s) URL to open and record (e.g. http://localhost:3000)."),
     durationSeconds: z
@@ -1691,6 +1743,7 @@ server.tool(
     let publicId = "";
     let sizeBytes = 0;
     const autoNotes: NarrationNote[] = [];
+    let capturedSource: Json | undefined;
     try {
       // ── Capture ──
       let videoPath: string;
@@ -1717,6 +1770,9 @@ server.tool(
           if (i === 0) {
             await waitForFirstPaint(page, frame);
             captureStart = Date.now();
+            // Resolve the capture source once the first real frame is up, so the
+            // reported URL/title are post-redirect truth, not the requested URL.
+            capturedSource = await resolveHeadlessSource(page, frame);
           }
           if (viewports) {
             autoNotes.push({
@@ -1786,6 +1842,7 @@ server.tool(
       agentContextUrl: `${API_URL}/api/agent-context/${publicId}`,
       sizeBytes,
       recordedSeconds: forSec * passes.length,
+      ...(capturedSource ? { source: capturedSource } : {}),
       ...(recordingKind ? { recordingKind } : {}),
       ...(viewports ? { viewports: passes.map((p) => p.label) } : {}),
       ...(profileCopy ? { profileCopy: profileCopyDisclosure(profileCopy, userDataDir!) } : {}),
@@ -1937,7 +1994,7 @@ function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Pr
 
 server.tool(
   "start_recording",
-  "Start a RECORDING SESSION: opens the given URL in a headless Chromium that keeps recording in the background while you continue working. Use add_marker to narrate (and optionally ASSERT on-screen state) at each step, add_chapter for before/after boundaries, then stop_recording to upload and get the share link. Set `type` for the recording kind, `storageState`/`initScript` to record behind a login, and `exposeCdp` to get a CDP endpoint you can drive with your own Playwright while it records. The session auto-stops and uploads by itself at maxSeconds (default 600) so a forgotten session can never run away. One session at a time. Requires Playwright + an ingest-scoped CLIPY_API_KEY (like the record tool). Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy session start --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is CLI-only — use `storageState` here; and backdating a mark by a relative offset (the CLI's `--ago`) is CLI-only — use add_marker's `atSeconds`.",
+  "Start a RECORDING SESSION: opens the given URL in a headless Chromium that keeps recording in the background while you continue working. Use add_marker to narrate (and optionally ASSERT on-screen state) at each step, add_chapter for before/after boundaries, then stop_recording to upload and get the share link. Set `type` for the recording kind, `storageState`/`initScript` to record behind a login, and `exposeCdp` to get a CDP endpoint you can drive with your own Playwright while it records. The session auto-stops and uploads by itself at maxSeconds (default 600) so a forgotten session can never run away. One session at a time. Requires Playwright + an ingest-scoped CLIPY_API_KEY (like the record tool). Recording the REAL Mac screen or a specific window (ScreenCaptureKit, real logged-in browser) is CLI-only — `clipy session start --source mac-screen --window \"<app>\"` — and not available via MCP. Quick per-cookie / per-localStorage-key injection (the CLI's `--cookie` / `--local-storage`) is CLI-only — use `storageState` here; and backdating a mark by a relative offset (the CLI's `--ago`) is CLI-only — use add_marker's `atSeconds`. The result reports the RESOLVED capture source (`source`: the post-redirect URL, page title and viewport actually being recorded) — compare it against the surface your driver is acting on BEFORE doing minutes of work, because Clipy will never focus or foreground a window or tab for you. This call waits for the initial navigation to settle before replying (bounded by the same 30s page-load timeout) so that reported source is measured rather than guessed — recording and the auto-stop rail both start immediately, so only the reply waits.",
   {
     url: z.string().describe("The http(s) URL to open and record (e.g. http://localhost:3000)."),
     name: z.string().optional().describe("Optional title for the recording."),
@@ -2208,11 +2265,15 @@ server.tool(
 
       activeSession = session;
       autoStoppedResult = null;
-      page
-        .goto(target.href, { waitUntil: "load", timeout: 30_000 })
-        .catch(() => {
-          // slow SPA — the recording is running regardless
-        });
+      // AWAITED (changed in 0.8.5): the result reports the RESOLVED capture
+      // source, which can only be read after navigation settles. The recording
+      // is already running and the auto-stop rail is already armed, so this only
+      // delays the reply — bounded by the same 30s goto timeout, and a timeout
+      // still yields whatever the page actually is rather than a guess.
+      await page.goto(target.href, { waitUntil: "load", timeout: 30_000 }).catch(() => {
+        // slow SPA — the recording is running regardless
+      });
+      const capturedSource = await resolveHeadlessSource(page, { width: w, height: h });
 
       // Describe the CDP outcome precisely: disabled-by-env, requested-but-
       // unreachable, or ready with the endpoints + driver gotchas.
@@ -2227,6 +2288,7 @@ server.tool(
       return ok({
         state: "recording",
         url: target.href,
+        source: capturedSource,
         maxSeconds: maxSec,
         ...(recordingKind ? { recordingKind } : {}),
         ...(profileCopy ? { profileCopy: profileCopyDisclosure(profileCopy, userDataDir!) } : {}),

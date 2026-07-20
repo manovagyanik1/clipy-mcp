@@ -174,6 +174,33 @@ cross-origin auth). For a full identity, pass `userDataDir` — Chrome's **user-
 
 `storageState` and `userDataDir` are mutually exclusive; `profileDirectory` requires `userDataDir`.
 
+### Check the camera before you work
+
+`record` and `start_recording` both return a `source` object describing **what is actually
+being recorded**, resolved fresh at start time — the post-redirect `url`, the page `title`,
+and the recording `viewport`:
+
+```json
+"source": {
+  "kind": "headless_browser",
+  "title": "Orders — Admin",
+  "url": "https://app.example.com/orders",
+  "viewport": { "width": 1280, "height": 720 }
+}
+```
+
+Compare it against the surface your driver is acting on **before** doing minutes of work.
+This exists because driver-attested evidence proves what the *driver* observed and nothing
+ties it to what the *camera* saw — it's entirely possible to produce truthful marks over
+footage of the wrong thing. **Clipy will never focus or foreground a window or tab for you**;
+pointing the driver and the camera at the same surface is the caller's job.
+
+`kind` is always `headless_browser` here: these tools record a headless page Clipy owns.
+Capturing a real application window or display is CLI-only
+(`clipy record --source mac-screen --window "<app>"`), so no window id or window title is
+reported — an empty or invented one would be exactly the kind of false confidence this
+field exists to prevent.
+
 ### Evidence on a marker: two provenances
 
 `add_marker` can carry evidence in exactly one of two provenances — they are tallied and rendered
