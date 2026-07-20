@@ -35,7 +35,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.5";
+const SERVER_VERSION = "0.8.6";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless

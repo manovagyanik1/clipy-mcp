@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "clipy",
   "display_name": "Clipy",
-  "version": "0.8.5",
+  "version": "0.8.6",
   "description": "Read your Clipy screen recordings: search, transcripts, AI summaries, and key moments with frames.",
   "long_description": "Clipy is an agent-readable screen recorder (free, no watermark — Mac, Chrome, web). This extension gives Claude access to your Clipy recordings: search your library, fetch timestamped transcripts, AI summaries, and key moments with the actual video frames (click markers burned in) as inline images. The `get_agent_context` tool bundles everything in one call — e.g. \"read this bug-report recording and ship the fix.\" Read tools need the default `recordings:read` scope; the record and transcript-edit tools require a key with the `ingest` scope (enforced server-side), so a `recordings:read`-only key can never create, modify, or delete recordings.",
   "author": {
