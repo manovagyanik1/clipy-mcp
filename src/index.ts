@@ -35,7 +35,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.1";
+const SERVER_VERSION = "0.8.2";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -1985,7 +1985,7 @@ async function applyMark(
     assertUrl?: string;
     failMode?: "warn" | "abort";
   },
-): Promise<{ note: NarrationNote; assertion: AssertOutcome | null; aborted: boolean }> {
+): Promise<{ note: NarrationNote; assertion: AssertOutcome | null; aborted: boolean; observedDriftSec?: number }> {
   if (opts.assertText && !opts.assertSelector) {
     throw new Error(
       "assertText requires assertSelector — name the element whose text you're checking. A bare page-body text match is weak evidence, so it's rejected (same rule as the CLI's --assert-text / --assert-selector).",
@@ -1994,6 +1994,7 @@ async function applyMark(
   const hasAssertion = !!(opts.assertSelector || opts.assertText || opts.assertUrl);
   let markText = text.trim();
   let assertion: AssertOutcome | null = null;
+  let observedDriftSec: number | undefined;
   if (hasAssertion) {
     try {
       assertion = await runMarkerAssertions(session.page, {
@@ -2016,6 +2017,23 @@ async function applyMark(
       session.assertUnverified += 1;
       markText = `${markText} [ASSERT ⚠ could not evaluate — ${assertion.observed}]`;
     }
+    // A backdated mark (atSeconds) carries an assertion that was observed NOW —
+    // right after the evaluate — not at the backdated position. Without atSeconds
+    // the stamp IS the observation moment (sessionMark stamps after this await),
+    // so there's nothing to reconcile. But when the stamp is decoupled and the
+    // two diverge by more than ~2s, annotate it: the verdict must never read as
+    // if it pertained to a moment it didn't observe.
+    if (opts.atSeconds != null) {
+      const observedAtMs = Math.max(0, Date.now() - session.recordStartEpochMs);
+      const markedAtMs = Math.max(0, Math.round(opts.atSeconds * 1000));
+      const driftMs = observedAtMs - markedAtMs;
+      if (Math.abs(driftMs) > 2000) {
+        observedDriftSec = Math.round(driftMs / 100) / 10; // signed, 1 dp
+        const dir = driftMs > 0 ? "after" : "before";
+        const mag = (Math.abs(driftMs) / 1000).toFixed(1);
+        markText = `${markText} (assertion observed ${mag}s ${dir} this backdated mark — the verdict is about the page at observation time, not at the marked time)`;
+      }
+    }
   }
   const note = sessionMark(session, markText, opts.atSeconds != null ? opts.atSeconds * 1000 : undefined);
 
@@ -2026,7 +2044,7 @@ async function applyMark(
     await finishSession(session, "abort").catch(() => {});
     aborted = true;
   }
-  return { note, assertion, aborted };
+  return { note, assertion, aborted, observedDriftSec };
 }
 
 /** Coerce a bridge-supplied (untrusted) options object into typed mark opts. */
@@ -2057,7 +2075,7 @@ server.tool(
       .min(0)
       .optional()
       .describe(
-        "Place the mark at this point on the recording timeline (seconds from the start), instead of the live clock — e.g. to annotate something that happened a few seconds ago. Clamped to >= 0. (The CLI's relative --ago shorthand is CLI-only; compute the absolute second and pass it here.)",
+        "Place the mark at this point on the recording timeline (seconds from the start), instead of the live clock — e.g. to annotate something that happened a few seconds ago. Clamped to >= 0. (The CLI's relative --ago shorthand is CLI-only; compute the absolute second and pass it here.) Note: any assertion is still evaluated NOW, against the live page — if that diverges from the backdated position by >2s, the mark is annotated so the verdict is never misread as pertaining to the backdated moment.",
       ),
     assertSelector: z
       .string()
@@ -2094,7 +2112,7 @@ server.tool(
       );
     }
     const session = activeSession;
-    const { note, assertion, aborted } = await applyMark(session, text, {
+    const { note, assertion, aborted, observedDriftSec } = await applyMark(session, text, {
       atSeconds,
       assertSelector,
       assertText,
@@ -2122,6 +2140,10 @@ server.tool(
           ? { assertion: { verified: false, unverified: true, observed: assertion.observed }, unverified: true }
           : { assertion: { passed: assertion.status === "passed", observed: assertion.observed } }
         : {}),
+      // Surface when a backdated mark's assertion was observed at a different
+      // time than the mark position, so the caller knows the verdict is about
+      // the page NOW, not at the backdated second.
+      ...(observedDriftSec != null ? { assertionObservedDriftSeconds: observedDriftSec } : {}),
       totalMarkers: session.marks.length,
     });
   },

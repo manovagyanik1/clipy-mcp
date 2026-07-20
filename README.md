@@ -40,6 +40,14 @@ immediately).
 
 Then add the server to your MCP client.
 
+> **Never inline your key into the server's launch command** — e.g.
+> `"command": "sh", "args": ["-c", "CLIPY_API_KEY=… npx -y @clipy/mcp"]`. Command-line
+> arguments are visible to **every local process** via the process table (`ps`, `/proc`),
+> so a key placed there is effectively world-readable on the machine. Always put it in the
+> `env` block, exactly as every example below does. (The one-time `claude mcp add --env …` /
+> `codex mcp add --env …` helpers below write that `env` block for you — they expose the key
+> only in the argv of that single setup command, never in the long-running server's.)
+
 ### Claude Code
 
 The `--scope user` flag installs Clipy **globally** for every project. Without it,
