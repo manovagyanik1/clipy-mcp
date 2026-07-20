@@ -35,7 +35,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.3";
+const SERVER_VERSION = "0.8.4";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -2398,15 +2398,17 @@ async function applyMark(
 
   if (hasAttest) {
     // Driver-attested: Clipy vouches the agent SAID this, not that Clipy verified
-    // it — falsifiable against the frames, weaker than clipy-verified.
+    // it — falsifiable against the frames, weaker than clipy-verified. The lane
+    // leads with a HEDGE glyph (≈) instead of ✓/✗ so a skimming reviewer reads it
+    // as weaker at a glance, not just on inspection. Byte-identical to the CLI.
     const observedStr = String(opts.observed).slice(0, 500);
     attestation = { verdict: opts.verdict!, observed: observedStr };
     if (opts.verdict === "pass") {
       session.attestPassed += 1;
-      markText = `${markText} [ASSERT ✓ driver-attested; observed=${observedStr}]`;
+      markText = `${markText} [≈ ASSERT driver-attested; observed=${observedStr}]`;
     } else {
       session.attestFailed += 1;
-      markText = `${markText} [ASSERT ✗ driver-attested; observed=${observedStr}]`;
+      markText = `${markText} [≈ FAILED driver-attested; observed=${observedStr}]`;
       failedForAbort = true;
     }
   } else if (hasAssertion) {
@@ -2488,7 +2490,7 @@ function coerceMarkOpts(raw: unknown): {
 
 server.tool(
   "add_marker",
-  "Drop a live-timestamped narration marker into the active recording session ('reproduced the bug', 'the fix renders correctly at mobile width'). Markers become the recording's transcript chapters, so narrate as you work — they are how the recording stays agent-readable despite having no audio. A mark can carry evidence in ONE of two provenances, never both. (1) CLIPY-VERIFIED — assertSelector (element must exist), assertText (that element must contain the text; requires assertSelector), assertUrl (glob on the live URL): Clipy itself checks the recorded page, so this is the strongest evidence. (2) DRIVER-ATTESTED — observed + verdict (both required together): you report what YOUR tooling saw and whether it passed. Clipy vouches only that you SAID it — it did NOT verify it — which is falsifiable against the recorded frames: weaker than clipy-verified, far stronger than plain prose. Use driver-attested when your agent drives its OWN browser/tooling while Clipy records (e.g. via mac-screen) or when there is no Clipy-owned page to assert against. Failures are annotated into the mark as explicit FAILURES (never written as fact), tallied in their own segment of the recording's verification summary, and — with failMode 'abort' — discard the whole session. Marks default to the live recording clock; pass atSeconds to backdate one.",
+  "Drop a live-timestamped narration marker into the active recording session ('reproduced the bug', 'the fix renders correctly at mobile width'). Markers become the recording's transcript chapters, so narrate as you work — they are how the recording stays agent-readable despite having no audio. A mark can carry evidence in ONE of two provenances, never both. (1) CLIPY-VERIFIED — assertSelector (element must exist), assertText (that element must contain the text; requires assertSelector), assertUrl (glob on the live URL): Clipy itself checks the recorded page, so this is the strongest evidence. (2) DRIVER-ATTESTED — observed + verdict (both required together): you report what YOUR tooling saw and whether it passed. Clipy vouches only that you SAID it — it did NOT verify it — which is falsifiable against the recorded frames: weaker than clipy-verified, far stronger than plain prose. Use driver-attested when your agent drives its OWN browser/tooling while Clipy records (e.g. via mac-screen) or when there is no Clipy-owned page to assert against. The two lanes are rendered so the weaker one LOOKS weaker at a glance: clipy-verified marks lead with a verdict glyph (`[assert ✓ verified-by-clipy; …]` / `[ASSERT ✗ verified-by-clipy; …]`), while driver-attested marks lead with a HEDGE glyph instead (`[≈ ASSERT driver-attested; observed=…]` / `[≈ FAILED driver-attested; observed=…]`) — a skimming reviewer must never mistake an attestation for a verification. Failures are annotated into the mark as explicit FAILURES (never written as fact), tallied in their own segment of the recording's verification summary, and — with failMode 'abort' — discard the whole session. Marks default to the live recording clock; pass atSeconds to backdate one.",
   {
     text: z.string().min(1).max(1000).describe("What is happening right now."),
     atSeconds: z
