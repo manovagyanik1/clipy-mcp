@@ -25,17 +25,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { closeSync, createWriteStream, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.2";
+const SERVER_VERSION = "0.8.3";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -541,33 +541,271 @@ function validateInitScriptFile(p: string): string {
   return resolved;
 }
 
-/** Validate a userDataDir (a whole Chromium profile) — resolves, confirms it's a
- *  directory, and REFUSES a live/locked profile (Chrome leaves SingletonLock /
- *  SingletonSocket while running). Returns the absolute path. */
-function validateUserDataDir(p: string): string {
+/** Does this directory hold a browser PROFILE's own files (as opposed to being a
+ *  user-data root, which holds 'Local State' + profile subdirs)? Single source of
+ *  truth for every profile-shape decision below. Chrome writes Preferences;
+ *  Playwright-made profiles may only have Cookies/History — accept any of them. */
+function looksLikeChromeProfileDir(dir: string): boolean {
+  return (
+    existsSync(join(dir, "Preferences")) ||
+    existsSync(join(dir, "Cookies")) ||
+    existsSync(join(dir, "History"))
+  );
+}
+
+/** Validate a userDataDir. It must exist and be a user-data ROOT (not a Chrome
+ *  PROFILE subdir — Chromium would silently mint a blank logged-out Default
+ *  inside it). Without a profileName (direct-open mode) it must also not be a
+ *  profile a live Chrome is holding open. WITH a profileName (copy mode) the
+ *  named subdir must exist; the live-lock becomes a warning at copy time (we
+ *  never open the real root). Returns the absolute path. Mirrors the CLI. */
+function validateUserDataDir(p: string, profileName?: string): string {
   const resolved = resolve(p);
   let st;
   try {
     st = statSync(resolved);
   } catch {
-    throw new Error(`userDataDir not found: ${resolved}`);
+    throw new Error(`userDataDir not found: ${resolved} (create it, or use a copy of a logged-in profile)`);
   }
   if (!st.isDirectory()) throw new Error(`userDataDir is not a directory: ${resolved}`);
-  let entries: string[];
-  try {
-    entries = readdirSync(resolved);
-  } catch {
-    throw new Error(`userDataDir is not readable: ${resolved}`);
-  }
-  // Match by NAME (these are often symlinks/sockets that statSync can't follow).
-  if (entries.includes("SingletonLock") || entries.includes("SingletonSocket")) {
+  // Reject a Chrome PROFILE directory passed as the root. Chrome stores profiles
+  // as subdirs (Default, Profile 1, …) of the user-data ROOT (which holds
+  // 'Local State'); pointing userDataDir at a profile makes Chromium treat it as
+  // a root and create a blank Default inside the real profile.
+  const base = basename(resolved);
+  const looksLikeProfileName = /^(Default|Profile \d+)$/.test(base);
+  const hasProfileFiles = looksLikeChromeProfileDir(resolved);
+  if (looksLikeProfileName || (hasProfileFiles && !existsSync(join(resolved, "Local State")))) {
     throw new Error(
-      `userDataDir looks like a LIVE Chrome profile — found a Singleton lock in ${resolved}. ` +
-        `Close that browser, or point userDataDir at a DEDICATED profile directory no running browser is using. ` +
-        `Driving a locked profile fails and risks corrupting it.`,
+      `userDataDir looks like a Chrome PROFILE directory, not a user-data root: ${resolved}. ` +
+        `Pass the PARENT directory (the one containing 'Local State') plus profileDirectory '${looksLikeProfileName ? base : "<name>"}'.`,
     );
   }
+  if (profileName != null) {
+    // Copy mode: the named profile subdir must exist inside the root AND look
+    // like a real Chrome profile. (Inverted from the root check on purpose: here
+    // the target IS supposed to be a profile.) Copying a missing or non-profile
+    // directory would hand back a BLANK identity wearing the profile's name.
+    const target = join(resolved, profileName);
+    const listProfiles = (): string[] => {
+      try {
+        return readdirSync(resolved, { withFileTypes: true })
+          .filter((e) => e.isDirectory() && /^(Default|Profile \d+)$/.test(e.name))
+          .map((e) => e.name);
+      } catch {
+        return [];
+      }
+    };
+    if (!existsSync(target)) {
+      const available = listProfiles();
+      throw new Error(
+        `profileDirectory '${profileName}' not found under ${resolved}` +
+          (available.length ? ` (available: ${available.join(", ")})` : "") +
+          `. Find the exact folder name at chrome://version → "Profile Path".`,
+      );
+    }
+    if (!looksLikeChromeProfileDir(target)) {
+      const available = listProfiles();
+      throw new Error(
+        `profileDirectory '${profileName}' (${target}) does not look like a Chrome profile — no Preferences/Cookies/History inside. ` +
+          `Copying it would record a BLANK, logged-out identity under that profile's name` +
+          (available.length ? ` (available: ${available.join(", ")})` : "") +
+          `. Find the exact folder name at chrome://version → "Profile Path".`,
+      );
+    }
+    return resolved; // the copy path handles a running Chrome (a warn), never opens the root
+  }
+  // Direct-open mode: refuse a profile a live Chrome is holding open.
+  for (const lock of ["SingletonLock", "SingletonSocket"]) {
+    if (existsSync(join(resolved, lock))) {
+      throw new Error(
+        `userDataDir looks like a live/locked Chrome profile (${lock} present): ${resolved}. ` +
+          `Close that Chrome, or use a COPY / a dedicated logged-in profile dir — Chrome locks a profile while open.`,
+      );
+    }
+  }
   return resolved;
+}
+
+// --- profileDirectory: copy a named Chrome profile into a scratch root -------
+// Playwright's launchPersistentContext IGNORES Chromium's --profile-directory
+// (verified 0.8.3: the switch is stripped, Default is always loaded), so
+// selecting a named profile means making it the Default of the root we open. We
+// COPY <root>/<name> into a temp scratch root's Default/ (+ the root's
+// 'Local State') and launch against that; the user's real profile is never
+// opened or written. LOUD by design — silent profile substitution is the enemy.
+// Mirrors the CLI (cli/src/index.ts copyProfileToScratchRoot).
+
+const PROFILE_COPY_PREFIX = "clipy-profile-";
+// Bulk cache dirs — identity lives in Cookies / Login Data / Local Storage /
+// Preferences, so we skip these to keep the copy small.
+const PROFILE_SKIP_TOP = new Set(["Cache", "Code Cache", "GPUCache"]);
+const SW_CACHE_FRAGMENT = join("Service Worker", "CacheStorage");
+
+/** Bytes we'll actually copy (identity, minus the skipped cache dirs). */
+function profileCopyableSize(profileDir: string): number {
+  let total = 0;
+  const walk = (p: string, top: boolean): void => {
+    let entries;
+    try {
+      entries = readdirSync(p, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (top && (e.name.startsWith("Singleton") || PROFILE_SKIP_TOP.has(e.name))) continue;
+      const full = join(p, e.name);
+      if (full.includes(SW_CACHE_FRAGMENT)) continue;
+      try {
+        if (e.isDirectory()) walk(full, false);
+        else total += statSync(full).size;
+      } catch {
+        // unreadable — skip
+      }
+    }
+  };
+  walk(profileDir, true);
+  return total;
+}
+
+interface ProfileCopy {
+  scratchRoot: string;
+  profileName: string;
+  sizeBytes: number;
+  chromeRunning: boolean;
+  skipped: string[];
+}
+
+/** Copy <userDataDir>/<profileName> into a fresh 0700 scratch root's Default/
+ *  (plus the root's 'Local State'), skipping Singleton-locks and cache dirs.
+ *  Best-effort per top-level entry, so a locked file loses only that entry.
+ *  Returns the scratch root to launch against + disclosure the caller surfaces. */
+function copyProfileToScratchRoot(userDataDir: string, profileName: string): ProfileCopy {
+  const srcProfile = join(userDataDir, profileName);
+  const chromeRunning =
+    existsSync(join(userDataDir, "SingletonLock")) || existsSync(join(userDataDir, "SingletonSocket"));
+  const sizeBytes = profileCopyableSize(srcProfile);
+  const scratchRoot = join(tmpdir(), `${PROFILE_COPY_PREFIX}${randomUUID()}`);
+  mkdirSync(scratchRoot, { recursive: true });
+  try {
+    chmodSync(scratchRoot, 0o700);
+  } catch {
+    // best-effort on platforms without POSIX modes
+  }
+  const destDefault = join(scratchRoot, "Default");
+  mkdirSync(destDefault, { recursive: true });
+  const skipped: string[] = [];
+  for (const entry of readdirSync(srcProfile, { withFileTypes: true })) {
+    const name = entry.name;
+    if (name.startsWith("Singleton") || PROFILE_SKIP_TOP.has(name)) continue;
+    try {
+      cpSync(join(srcProfile, name), join(destDefault, name), {
+        recursive: true,
+        // Skip the bulk CacheStorage nested under Service Worker.
+        filter: (s) => !s.includes(SW_CACHE_FRAGMENT),
+      });
+    } catch {
+      skipped.push(name); // locked/unreadable — best-effort
+    }
+  }
+  // 'Local State' lives at the root and carries the os_crypt key Linux uses to
+  // decrypt Cookies/Login Data (harmless elsewhere — macOS keys off the Keychain).
+  try {
+    if (existsSync(join(userDataDir, "Local State"))) {
+      cpSync(join(userDataDir, "Local State"), join(scratchRoot, "Local State"));
+    }
+  } catch {
+    // best-effort
+  }
+  serverLog(
+    `copied profile '${profileName}' (${sizeBytes} bytes) into ${scratchRoot}` +
+      (chromeRunning ? " — Chrome appears to be running, copy may be inconsistent" : ""),
+  );
+  return { scratchRoot, profileName, sizeBytes, chromeRunning, skipped };
+}
+
+/** Remove stranded profile copies (a SIGKILL between copy and cleanup can leave
+ *  one). Swept at the start of every record/session start. Best-effort. */
+function sweepStaleProfileCopies(): void {
+  const now = Date.now();
+  let entries;
+  try {
+    entries = readdirSync(tmpdir(), { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const e of entries) {
+    if (!e.isDirectory() || !e.name.startsWith(PROFILE_COPY_PREFIX)) continue;
+    const full = join(tmpdir(), e.name);
+    try {
+      if (now - statSync(full).mtimeMs > 24 * 3600 * 1000) rmSync(full, { recursive: true, force: true });
+    } catch {
+      // best-effort
+    }
+  }
+}
+
+/** Warning for BARE userDataDir (no profileDirectory) pointed at what looks like
+ *  a REAL Chrome user-data root: that mode opens the root's Default profile in
+ *  place and Chromium WILL write to it. Returns undefined for a dedicated/scratch
+ *  dir, where in-place use is exactly what the caller wants. */
+function bareRealRootWarning(userDataDirPath: string): string | undefined {
+  // Discriminators that mean "the user's real Chrome profile store", chosen so a
+  // Clipy/Playwright-managed dedicated dir never trips them: Chrome writes
+  // 'Local State' and numbered 'Profile N' dirs, Playwright writes neither (it
+  // only ever creates a bare 'Default/'), so a plain Default is NOT a signal.
+  const hasLocalState = existsSync(join(userDataDirPath, "Local State"));
+  let hasNumberedProfile = false;
+  try {
+    hasNumberedProfile = readdirSync(userDataDirPath, { withFileTypes: true }).some(
+      (e) =>
+        e.isDirectory() &&
+        /^Profile \d+$/.test(e.name) &&
+        looksLikeChromeProfileDir(join(userDataDirPath, e.name)),
+    );
+  } catch {
+    hasNumberedProfile = false;
+  }
+  if (!hasLocalState && !hasNumberedProfile) return undefined;
+  return (
+    `userDataDir points at what looks like a REAL Chrome user-data root and no profileDirectory was given, ` +
+    `so this recording OPENS that root's 'Default' profile in place — Chromium can write to your real profile ` +
+    `(history, cookies, session). Prefer profileDirectory:'Default' (Clipy records an ephemeral COPY and never ` +
+    `touches the original), or capture the real browser via the CLI's --source mac-screen.`
+  );
+}
+
+/** Cookie-decryption caveat for a copied REAL Chrome profile on macOS. Chrome
+ *  encrypts its cookies with the "Chrome Safe Storage" Keychain key, but the
+ *  recorder's bundled Chromium looks for "Chromium Safe Storage" — so a copied
+ *  profile can render a browser that LOOKS like the user's identity while being
+ *  silently logged out of cookie-based sessions. Exactly the false-identity class
+ *  this feature exists to prevent, so it ships in the disclosure, not a footnote.
+ *  (Pre-existing Playwright-vs-Chrome constraint, not caused by the copy. Linux
+ *  keys off the copied 'Local State' and Windows off DPAPI, so it's macOS-only.) */
+const MACOS_COOKIE_CAVEAT =
+  "On macOS, cookie-based logins in a real Chrome profile may NOT decrypt under the recorder's Chromium " +
+  "(Chrome and Chromium use different Keychain keys) — localStorage/Preferences-based sessions survive. " +
+  "If the recording lands logged out, that is why: record your real browser via the CLI's " +
+  "`clipy record --source mac-screen`, or drive your own browser and attach evidence with add_marker's observed/verdict.";
+
+/** The loud tool-result disclosure for a profile copy. */
+function profileCopyDisclosure(copy: ProfileCopy, userDataDir: string): Json {
+  return {
+    profile: copy.profileName,
+    copiedBytes: copy.sizeBytes,
+    note:
+      `Recorded a TEMPORARY COPY of profile '${copy.profileName}' from ${userDataDir}. ` +
+      `Your real profile was never opened or modified; the copy is deleted after upload.`,
+    ...(process.platform === "darwin" ? { cookieDecryptionCaveat: MACOS_COOKIE_CAVEAT } : {}),
+    ...(copy.chromeRunning
+      ? {
+          warning:
+            "Chrome appears to be running — in-use databases may have copied inconsistently. Quit Chrome for a guaranteed-clean copy.",
+        }
+      : {}),
+    ...(copy.skipped.length ? { skippedEntries: copy.skipped } : {}),
+  };
 }
 
 /** First line of an error message, trimmed — keeps annotations/logs one-line. */
@@ -598,6 +836,9 @@ interface OpenedCapture {
 async function openCaptureContext(
   chromium: PwChromium,
   opts: {
+    // The effective persistent dir: userDataDir directly, or (for profileDirectory)
+    // the scratch root the caller copied the named profile into. Playwright always
+    // uses this dir's "Default" profile.
     userDataDir?: string;
     viewport: { width: number; height: number };
     recordDir: string;
@@ -1342,7 +1583,13 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Path to a DEDICATED Chromium user-data (profile) directory to record with a full browser identity — launched via launchPersistentContext. Use a profile NO running browser is using (a live/locked profile is refused). Mutually exclusive with storageState.",
+        "Path to a Chromium user-data ROOT — the dir holding 'Local State' plus profile subdirs (macOS Chrome: ~/Library/Application Support/Google/Chrome). WITHOUT profileDirectory, Clipy opens this dir's 'Default' profile directly and writes to it, so it is refused while a live Chrome holds it locked (quit Chrome first). WITH profileDirectory, Clipy COPIES that named profile into a temporary root and records the copy — your real profile is never opened or modified. A profile SUBDIR passed as the root is refused. Mutually exclusive with storageState.",
+      ),
+    profileDirectory: z
+      .string()
+      .optional()
+      .describe(
+        "Which profile INSIDE userDataDir to record — 'Default', 'Profile 1', 'Profile 2', … (exact folder name from chrome://version → 'Profile Path'). Clipy COPIES that profile into a temporary scratch root (as its Default) and records the copy: your real profile is never opened or modified, and the copy is deleted after upload. The result discloses the copy. Requires userDataDir. (Playwright strips Chromium's --profile-directory, so copying is the only way to select a named profile.)",
       ),
     initScript: z
       .string()
@@ -1353,7 +1600,7 @@ server.tool(
     width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280). Ignored when `viewports` is set."),
     height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720). Ignored when `viewports` is set."),
   },
-  async ({ url, durationSeconds, name, description, type, viewports, notes, storageState, userDataDir, initScript, width, height }) => {
+  async ({ url, durationSeconds, name, description, type, viewports, notes, storageState, userDataDir, profileDirectory, initScript, width, height }) => {
     // Validate the URL before spinning up a browser.
     let target: URL;
     try {
@@ -1395,12 +1642,17 @@ server.tool(
         "userDataDir and storageState are mutually exclusive — userDataDir launches a whole persistent profile; storageState seeds a fresh context. Pick one.",
       );
     }
+    if (profileDirectory && !userDataDir) {
+      return fail(
+        "profileDirectory requires userDataDir — it names a profile subdir ('Default', 'Profile 1', …) INSIDE a Chromium user-data root. Pass userDataDir=<the user-data root> too.",
+      );
+    }
     let storageStatePath: string | undefined;
     let userDataDirPath: string | undefined;
     let initScriptPath: string | undefined;
     try {
       if (storageState) storageStatePath = validateStorageStateFile(storageState);
-      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir);
+      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir, profileDirectory);
       if (initScript) initScriptPath = validateInitScriptFile(initScript);
     } catch (e) {
       return fail((e as Error).message);
@@ -1418,6 +1670,24 @@ server.tool(
     }
     mkdirSync(dir, { recursive: true });
 
+    // profileDirectory ⇒ copy the named profile into a scratch root and launch
+    // against that (Playwright can't select a named profile any other way).
+    sweepStaleProfileCopies();
+    let profileCopy: ProfileCopy | undefined;
+    let effectivePersistentDir = userDataDirPath;
+    // Bare userDataDir at a real Chrome root opens (and can write to) the real
+    // Default profile — surface that rather than letting it happen quietly.
+    const bareRootWarning =
+      userDataDirPath && !profileDirectory ? bareRealRootWarning(userDataDirPath) : undefined;
+    if (userDataDirPath && profileDirectory) {
+      try {
+        profileCopy = copyProfileToScratchRoot(userDataDirPath, profileDirectory);
+        effectivePersistentDir = profileCopy.scratchRoot;
+      } catch (e) {
+        return fail(`profile copy failed: ${(e as Error).message}`);
+      }
+    }
+
     let publicId = "";
     let sizeBytes = 0;
     const autoNotes: NarrationNote[] = [];
@@ -1425,7 +1695,7 @@ server.tool(
       // ── Capture ──
       let videoPath: string;
       const opened = await openCaptureContext(chromium, {
-        userDataDir: userDataDirPath,
+        userDataDir: effectivePersistentDir,
         viewport: { width: frame.width, height: frame.height },
         recordDir: dir,
         recordSize: frame,
@@ -1499,6 +1769,15 @@ server.tool(
       } catch {
         // best-effort temp cleanup
       }
+      // Remove the copied-profile scratch root (a SIGKILL strands it → the 24h
+      // sweep at the next record/session start catches that).
+      if (profileCopy) {
+        try {
+          rmSync(profileCopy.scratchRoot, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
+      }
     }
 
     return ok({
@@ -1509,6 +1788,8 @@ server.tool(
       recordedSeconds: forSec * passes.length,
       ...(recordingKind ? { recordingKind } : {}),
       ...(viewports ? { viewports: passes.map((p) => p.label) } : {}),
+      ...(profileCopy ? { profileCopy: profileCopyDisclosure(profileCopy, userDataDir!) } : {}),
+      ...(bareRootWarning ? { userDataDirWarning: bareRootWarning } : {}),
       next: "Processing runs in the background. Call wait_for_artifacts with this id (require:'all'), then get_agent_context / get_transcript to read it.",
     });
   },
@@ -1539,13 +1820,18 @@ interface McpRecordingSession {
   name?: string;
   description?: string;
   recordingKind?: string;
+  /** For profileDirectory (copy mode): the temp scratch root to delete on finish. */
+  profileScratchRoot?: string;
   maxSec: number;
   recordStartEpochMs: number;
   marks: NarrationNote[];
-  /** Assertion tally (add_marker / CDP bridge) — surfaced as a [verification] note. */
+  /** Clipy-VERIFIED assertion tally (add_marker / CDP bridge) — [verification] note. */
   assertPassed: number;
   assertFailed: number;
   assertUnverified: number;
+  /** DRIVER-ATTESTED tally (add_marker observed/verdict) — a separate provenance. */
+  attestPassed: number;
+  attestFailed: number;
   /** CDP endpoints when the session was started with exposeCdp (else undefined). */
   cdpUrl?: string;
   cdpHttpUrl?: string;
@@ -1568,6 +1854,25 @@ function sessionMark(session: McpRecordingSession, text: string, atMs?: number):
   return note;
 }
 
+/** The segmented [verification] transcript note, or "" when no assertion ran.
+ *  Format: `[verification] N clipy-verified: P passed, F failed, K unverified ·
+ *  M driver-attested: P passed, F failed` — segments omitted when their lane is
+ *  empty; the unverified clause omitted when K=0. */
+function buildVerificationNote(session: McpRecordingSession): string {
+  const clipyTotal = session.assertPassed + session.assertFailed + session.assertUnverified;
+  const driverTotal = session.attestPassed + session.attestFailed;
+  if (clipyTotal === 0 && driverTotal === 0) return "";
+  const segments: string[] = [];
+  if (clipyTotal > 0) {
+    const unverifiedClause = session.assertUnverified > 0 ? `, ${session.assertUnverified} unverified` : "";
+    segments.push(`${clipyTotal} clipy-verified: ${session.assertPassed} passed, ${session.assertFailed} failed${unverifiedClause}`);
+  }
+  if (driverTotal > 0) {
+    segments.push(`${driverTotal} driver-attested: ${session.attestPassed} passed, ${session.attestFailed} failed`);
+  }
+  return `[verification] ${segments.join(" · ")}`;
+}
+
 /** Close the browser, upload the capture (unless aborting), clean up. */
 function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Promise<Json> {
   if (session.finishing) return session.finishing;
@@ -1584,16 +1889,12 @@ function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Pr
       const videoPath = await video.path();
       await session.browser?.close().catch(() => {});
       const collected = [...session.marks];
-      // If any assertions ran, lead the transcript with a verification summary
-      // at 0ms so a reader sees the pass/fail/unverified tally up front.
-      const assertionsRan = session.assertPassed + session.assertFailed + session.assertUnverified;
-      if (assertionsRan > 0) {
-        const unverifiedClause = session.assertUnverified > 0 ? `, ${session.assertUnverified} unverified` : "";
-        collected.unshift({
-          startMs: 0,
-          text: `[verification] ${assertionsRan} assertion${assertionsRan === 1 ? "" : "s"}: ${session.assertPassed} passed, ${session.assertFailed} failed${unverifiedClause}`,
-        });
-      }
+      // Lead the transcript at 0ms with a SEGMENTED verification summary so a
+      // reader sees the two provenances separately — clipy-verified marks (Clipy
+      // checked the live page) and driver-attested marks (the agent SAID it, Clipy
+      // only vouches it was claimed). Empty segments are omitted.
+      const verificationNote = buildVerificationNote(session);
+      if (verificationNote) collected.unshift({ startMs: 0, text: verificationNote });
       const notes = collected.sort((a, b) => a.startMs - b.startMs);
       const uploaded = await uploadCapturedWebm({
         videoPath,
@@ -1618,6 +1919,15 @@ function finishSession(session: McpRecordingSession, mode: "stop" | "abort"): Pr
         rmSync(session.tmpDir, { recursive: true, force: true });
       } catch {
         // best-effort temp cleanup
+      }
+      // Delete the copied-profile scratch root (a SIGKILL strands it → the 24h
+      // sweep at the next record/session start catches that).
+      if (session.profileScratchRoot) {
+        try {
+          rmSync(session.profileScratchRoot, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
       }
       if (activeSession === session) activeSession = null;
     }
@@ -1663,7 +1973,13 @@ server.tool(
       .string()
       .optional()
       .describe(
-        "Path to a DEDICATED Chromium user-data (profile) directory to record with a full browser identity (launchPersistentContext). Use a profile NO running browser is using (a live/locked profile is refused). Mutually exclusive with storageState.",
+        "Path to a Chromium user-data ROOT — the dir holding 'Local State' plus profile subdirs (macOS Chrome: ~/Library/Application Support/Google/Chrome). WITHOUT profileDirectory, Clipy opens this dir's 'Default' profile directly and writes to it, so it is refused while a live Chrome holds it locked (quit Chrome first). WITH profileDirectory, Clipy COPIES that named profile into a temporary root and records the copy — your real profile is never opened or modified. A profile SUBDIR passed as the root is refused. Mutually exclusive with storageState.",
+      ),
+    profileDirectory: z
+      .string()
+      .optional()
+      .describe(
+        "Which profile INSIDE userDataDir to record — 'Default', 'Profile 1', 'Profile 2', … (exact folder name from chrome://version → 'Profile Path'). Clipy COPIES that profile into a temporary scratch root (as its Default) and records the copy: your real profile is never opened or modified, and the copy is deleted after upload. The result discloses the copy. Requires userDataDir. (Playwright strips Chromium's --profile-directory, so copying is the only way to select a named profile.)",
       ),
     initScript: z
       .string()
@@ -1674,7 +1990,7 @@ server.tool(
     width: z.number().int().min(320).max(3840).optional().describe("Viewport + video width (default 1280)."),
     height: z.number().int().min(240).max(2160).optional().describe("Viewport + video height (default 720)."),
   },
-  async ({ url, name, description, type, maxSeconds, exposeCdp, storageState, userDataDir, initScript, width, height }) => {
+  async ({ url, name, description, type, maxSeconds, exposeCdp, storageState, userDataDir, profileDirectory, initScript, width, height }) => {
     let target: URL;
     try {
       target = new URL(url);
@@ -1704,12 +2020,17 @@ server.tool(
         "userDataDir and storageState are mutually exclusive — userDataDir launches a whole persistent profile; storageState seeds a fresh context. Pick one.",
       );
     }
+    if (profileDirectory && !userDataDir) {
+      return fail(
+        "profileDirectory requires userDataDir — it names a profile subdir ('Default', 'Profile 1', …) INSIDE a Chromium user-data root. Pass userDataDir=<the user-data root> too.",
+      );
+    }
     let storageStatePath: string | undefined;
     let userDataDirPath: string | undefined;
     let initScriptPath: string | undefined;
     try {
       if (storageState) storageStatePath = validateStorageStateFile(storageState);
-      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir);
+      if (userDataDir) userDataDirPath = validateUserDataDir(userDataDir, profileDirectory);
       if (initScript) initScriptPath = validateInitScriptFile(initScript);
     } catch (e) {
       return fail((e as Error).message);
@@ -1728,6 +2049,30 @@ server.tool(
     const tmpDirPath = join(tmpdir(), `clipy-mcp-session-${randomUUID()}`);
     mkdirSync(tmpDirPath, { recursive: true });
 
+    // profileDirectory ⇒ copy the named profile into a scratch root and launch
+    // against that. The scratch root lives for the whole session; finishSession
+    // removes it. On any failure below we clean it up before returning.
+    sweepStaleProfileCopies();
+    let profileCopy: ProfileCopy | undefined;
+    let effectivePersistentDir = userDataDirPath;
+    // Bare userDataDir at a real Chrome root opens (and can write to) the real
+    // Default profile — surface that rather than letting it happen quietly.
+    const bareRootWarning =
+      userDataDirPath && !profileDirectory ? bareRealRootWarning(userDataDirPath) : undefined;
+    if (userDataDirPath && profileDirectory) {
+      try {
+        profileCopy = copyProfileToScratchRoot(userDataDirPath, profileDirectory);
+        effectivePersistentDir = profileCopy.scratchRoot;
+      } catch (e) {
+        try {
+          rmSync(tmpDirPath, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
+        return fail(`profile copy failed: ${(e as Error).message}`);
+      }
+    }
+
     // CDP is OPT-IN and the env kill switch wins over the flag: only open a
     // debugging port when the caller asked AND CLIPY_DISABLE_CDP isn't set.
     const cdpDisabled = process.env.CLIPY_DISABLE_CDP === "1";
@@ -1736,7 +2081,7 @@ server.tool(
     try {
       const cdpPort = wantCdp ? await pickFreePort().catch(() => 0) : 0;
       const opened = await openCaptureContext(chromium, {
-        userDataDir: userDataDirPath,
+        userDataDir: effectivePersistentDir,
         viewport: { width: w, height: h },
         recordDir: tmpDirPath,
         recordSize: { width: w, height: h },
@@ -1764,6 +2109,7 @@ server.tool(
         context,
         page,
         tmpDir: tmpDirPath,
+        profileScratchRoot: profileCopy?.scratchRoot,
         url: target.href,
         name,
         description,
@@ -1774,6 +2120,8 @@ server.tool(
         assertPassed: 0,
         assertFailed: 0,
         assertUnverified: 0,
+        attestPassed: 0,
+        attestFailed: 0,
         cdpUrl,
         cdpHttpUrl,
         maxTimer: setTimeout(() => {}, 0),
@@ -1791,13 +2139,28 @@ server.tool(
           .exposeBinding("__clipyMark", async (_source: unknown, ...args: unknown[]) => {
             if (session.finishing) throw new Error("recording session is finishing — mark ignored");
             const markText = String(args[0] ?? "").slice(0, 1000);
-            const { note, assertion, aborted } = await applyMark(session, markText, coerceMarkOpts(args[1]));
+            const { note, assertion, attestation, aborted } = await applyMark(
+              session,
+              markText,
+              coerceMarkOpts(args[1]),
+            );
             return {
               atSeconds: Math.round(note.startMs / 100) / 10,
               ...(assertion
                 ? assertion.status === "unverified"
-                  ? { unverified: true, observed: assertion.observed }
-                  : { passed: assertion.status === "passed", observed: assertion.observed }
+                  ? { provenance: "clipy-verified", unverified: true, observed: assertion.observed }
+                  : {
+                      provenance: "clipy-verified",
+                      passed: assertion.status === "passed",
+                      observed: assertion.observed,
+                    }
+                : {}),
+              ...(attestation
+                ? {
+                    provenance: "driver-attested",
+                    passed: attestation.verdict === "pass",
+                    observed: attestation.observed,
+                  }
                 : {}),
               ...(aborted ? { aborted: true } : {}),
             };
@@ -1866,6 +2229,8 @@ server.tool(
         url: target.href,
         maxSeconds: maxSec,
         ...(recordingKind ? { recordingKind } : {}),
+        ...(profileCopy ? { profileCopy: profileCopyDisclosure(profileCopy, userDataDir!) } : {}),
+        ...(bareRootWarning ? { userDataDirWarning: bareRootWarning } : {}),
         ...cdpResult,
         next: "The session is recording. Use add_marker to narrate (and optionally assert) each step, add_chapter for before/after boundaries; call stop_recording when done (or abort_recording to discard). It auto-stops + uploads at the max duration.",
       });
@@ -1874,6 +2239,14 @@ server.tool(
         rmSync(tmpDirPath, { recursive: true, force: true });
       } catch {
         // best-effort
+      }
+      // Launch failed before the session took ownership of the scratch root — clean it up.
+      if (profileCopy) {
+        try {
+          rmSync(profileCopy.scratchRoot, { recursive: true, force: true });
+        } catch {
+          // best-effort
+        }
       }
       return fail((e as Error).message);
     }
@@ -1969,12 +2342,19 @@ async function runMarkerAssertions(page: PwPage, a: AssertInput): Promise<Assert
   return { status: failed ? "failed" : "passed", expected: expected.join("; "), observed: observed.join("; ") };
 }
 
-/** Apply a mark to the session: strict assertText/assertSelector contract,
- *  evaluate assertions, annotate the mark so pass/fail/unverified is explicit,
- *  update the tally, and abort the session on a FAILED assert under failMode
- *  'abort'. Shared by the add_marker tool and the in-page CDP bridge. Throws on
- *  the assertText-without-assertSelector contract violation (so a CDP driver
- *  sees the rejection). */
+interface Attestation {
+  verdict: "pass" | "fail";
+  observed: string;
+}
+
+/** Apply a mark to the session. Two mutually-exclusive evidence provenances:
+ *  CLIPY-VERIFIED (assertSelector/assertText/assertUrl — Clipy checks the live
+ *  page) and DRIVER-ATTESTED (observed/verdict — Clipy only vouches the agent
+ *  SAID it). Annotates the mark so the provenance + outcome are explicit (never
+ *  pooled), updates the matching tally, and aborts on a FAILED outcome under
+ *  failMode 'abort'. Shared by the add_marker tool and the in-page CDP bridge.
+ *  Throws on the one-provenance / both-or-neither / assertText-needs-selector
+ *  contract violations (so a CDP driver sees the rejection). */
 async function applyMark(
   session: McpRecordingSession,
   text: string,
@@ -1984,18 +2364,52 @@ async function applyMark(
     assertText?: string;
     assertUrl?: string;
     failMode?: "warn" | "abort";
+    observed?: string;
+    verdict?: "pass" | "fail";
   },
-): Promise<{ note: NarrationNote; assertion: AssertOutcome | null; aborted: boolean; observedDriftSec?: number }> {
+): Promise<{
+  note: NarrationNote;
+  assertion: AssertOutcome | null;
+  attestation: Attestation | null;
+  aborted: boolean;
+  observedDriftSec?: number;
+}> {
+  const hasAttest = opts.observed != null || opts.verdict != null;
+  const hasAssertion = !!(opts.assertSelector || opts.assertText || opts.assertUrl);
+  if (hasAttest && hasAssertion) {
+    throw new Error(
+      "driver-attested (observed/verdict) and clipy-evaluated (assertSelector/assertText/assertUrl) are mutually exclusive — one provenance per mark.",
+    );
+  }
+  if ((opts.observed != null) !== (opts.verdict != null)) {
+    throw new Error("observed and verdict must be provided together (both or neither).");
+  }
   if (opts.assertText && !opts.assertSelector) {
     throw new Error(
       "assertText requires assertSelector — name the element whose text you're checking. A bare page-body text match is weak evidence, so it's rejected (same rule as the CLI's --assert-text / --assert-selector).",
     );
   }
-  const hasAssertion = !!(opts.assertSelector || opts.assertText || opts.assertUrl);
+
   let markText = text.trim();
   let assertion: AssertOutcome | null = null;
+  let attestation: Attestation | null = null;
   let observedDriftSec: number | undefined;
-  if (hasAssertion) {
+  let failedForAbort = false;
+
+  if (hasAttest) {
+    // Driver-attested: Clipy vouches the agent SAID this, not that Clipy verified
+    // it — falsifiable against the frames, weaker than clipy-verified.
+    const observedStr = String(opts.observed).slice(0, 500);
+    attestation = { verdict: opts.verdict!, observed: observedStr };
+    if (opts.verdict === "pass") {
+      session.attestPassed += 1;
+      markText = `${markText} [ASSERT ✓ driver-attested; observed=${observedStr}]`;
+    } else {
+      session.attestFailed += 1;
+      markText = `${markText} [ASSERT ✗ driver-attested; observed=${observedStr}]`;
+      failedForAbort = true;
+    }
+  } else if (hasAssertion) {
     try {
       assertion = await runMarkerAssertions(session.page, {
         assertSelector: opts.assertSelector,
@@ -2009,20 +2423,22 @@ async function applyMark(
     }
     if (assertion.status === "passed") {
       session.assertPassed += 1;
-      markText = `${markText} [assert ✓ ${assertion.observed}]`;
+      markText = `${markText} [assert ✓ verified-by-clipy; ${assertion.observed}]`;
     } else if (assertion.status === "failed") {
       session.assertFailed += 1;
-      markText = `${markText} [ASSERT ✗ expected ${assertion.expected}; observed ${assertion.observed}]`;
+      markText = `${markText} [ASSERT ✗ verified-by-clipy; expected ${assertion.expected}; observed ${assertion.observed}]`;
+      failedForAbort = true;
     } else {
       session.assertUnverified += 1;
-      markText = `${markText} [ASSERT ⚠ could not evaluate — ${assertion.observed}]`;
+      markText = `${markText} [ASSERT ⚠ clipy could not evaluate — ${assertion.observed}]`;
     }
     // A backdated mark (atSeconds) carries an assertion that was observed NOW —
     // right after the evaluate — not at the backdated position. Without atSeconds
     // the stamp IS the observation moment (sessionMark stamps after this await),
     // so there's nothing to reconcile. But when the stamp is decoupled and the
     // two diverge by more than ~2s, annotate it: the verdict must never read as
-    // if it pertained to a moment it didn't observe.
+    // if it pertained to a moment it didn't observe. (Driver-attested has no Clipy
+    // observation time, so this never applies to it.)
     if (opts.atSeconds != null) {
       const observedAtMs = Math.max(0, Date.now() - session.recordStartEpochMs);
       const markedAtMs = Math.max(0, Math.round(opts.atSeconds * 1000));
@@ -2037,14 +2453,14 @@ async function applyMark(
   }
   const note = sessionMark(session, markText, opts.atSeconds != null ? opts.atSeconds * 1000 : undefined);
 
-  // failMode 'abort' discards the session ONLY on a definitive failure — never
-  // on an unverified claim (inability to check must not nuke the recording).
+  // failMode 'abort' discards the session ONLY on a definitive FAILURE (clipy
+  // assert failed, or driver attested a failure) — never on an unverified claim.
   let aborted = false;
-  if (assertion && assertion.status === "failed" && opts.failMode === "abort") {
+  if (failedForAbort && opts.failMode === "abort") {
     await finishSession(session, "abort").catch(() => {});
     aborted = true;
   }
-  return { note, assertion, aborted, observedDriftSec };
+  return { note, assertion, attestation, aborted, observedDriftSec };
 }
 
 /** Coerce a bridge-supplied (untrusted) options object into typed mark opts. */
@@ -2053,21 +2469,26 @@ function coerceMarkOpts(raw: unknown): {
   assertText?: string;
   assertUrl?: string;
   failMode?: "warn" | "abort";
+  observed?: string;
+  verdict?: "pass" | "fail";
 } {
   const o = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const str = (v: unknown) => (typeof v === "string" && v.trim() ? v : undefined);
   const failMode = o.failMode === "abort" ? "abort" : o.failMode === "warn" ? "warn" : undefined;
+  const verdict = o.verdict === "pass" ? "pass" : o.verdict === "fail" ? "fail" : undefined;
   return {
     assertSelector: str(o.assertSelector),
     assertText: str(o.assertText),
     assertUrl: str(o.assertUrl),
     failMode,
+    observed: str(o.observed),
+    verdict,
   };
 }
 
 server.tool(
   "add_marker",
-  "Drop a live-timestamped narration marker into the active recording session ('reproduced the bug', 'the fix renders correctly at mobile width'). Markers become the recording's transcript chapters, so narrate as you work — they are how the recording stays agent-readable despite having no audio. Optionally VERIFY on-screen state at the mark: assertSelector (element must exist), assertText (that element must contain the text — requires assertSelector), assertUrl (glob match on the live URL). A failed assertion is annotated into the mark as an explicit FAILURE (never written as fact), counted into the recording's verification summary, and — with failMode 'abort' — discards the whole session. Marks default to the live recording clock; pass atSeconds to backdate one.",
+  "Drop a live-timestamped narration marker into the active recording session ('reproduced the bug', 'the fix renders correctly at mobile width'). Markers become the recording's transcript chapters, so narrate as you work — they are how the recording stays agent-readable despite having no audio. A mark can carry evidence in ONE of two provenances, never both. (1) CLIPY-VERIFIED — assertSelector (element must exist), assertText (that element must contain the text; requires assertSelector), assertUrl (glob on the live URL): Clipy itself checks the recorded page, so this is the strongest evidence. (2) DRIVER-ATTESTED — observed + verdict (both required together): you report what YOUR tooling saw and whether it passed. Clipy vouches only that you SAID it — it did NOT verify it — which is falsifiable against the recorded frames: weaker than clipy-verified, far stronger than plain prose. Use driver-attested when your agent drives its OWN browser/tooling while Clipy records (e.g. via mac-screen) or when there is no Clipy-owned page to assert against. Failures are annotated into the mark as explicit FAILURES (never written as fact), tallied in their own segment of the recording's verification summary, and — with failMode 'abort' — discard the whole session. Marks default to the live recording clock; pass atSeconds to backdate one.",
   {
     text: z.string().min(1).max(1000).describe("What is happening right now."),
     atSeconds: z
@@ -2097,12 +2518,35 @@ server.tool(
       .enum(["warn", "abort"])
       .optional()
       .describe(
-        "On a FAILED assertion: 'warn' (default) records the failure and keeps recording; 'abort' discards the whole session (like abort_recording) and returns loudly. A passing assertion never aborts.",
+        "On a FAILED outcome (a clipy-verified assertion that failed, or a driver-attested verdict of 'fail'): 'warn' (default) records the failure and keeps recording; 'abort' discards the whole session (like abort_recording) and returns loudly. A pass never aborts; an unverified claim never aborts.",
+      ),
+    observed: z
+      .string()
+      .optional()
+      .describe(
+        "DRIVER-ATTESTED evidence: what YOUR tooling observed (e.g. 'HTTP 200, body contains orderId'). Requires verdict. Mutually exclusive with assertSelector/assertText/assertUrl — one provenance per mark.",
+      ),
+    verdict: z
+      .enum(["pass", "fail"])
+      .optional()
+      .describe(
+        "DRIVER-ATTESTED outcome for `observed`. Requires observed. Mutually exclusive with assertSelector/assertText/assertUrl.",
       ),
   },
-  async ({ text, atSeconds, assertSelector, assertText, assertUrl, failMode }) => {
+  async ({ text, atSeconds, assertSelector, assertText, assertUrl, failMode, observed, verdict }) => {
     if (!activeSession || activeSession.finishing) {
       return fail("no active recording session — call start_recording first.");
+    }
+    // One provenance per mark: Clipy-verified OR driver-attested, never both.
+    if ((observed != null || verdict != null) && (assertSelector || assertText || assertUrl)) {
+      return fail(
+        "driver-attested (observed/verdict) and clipy-evaluated (assertSelector/assertText/assertUrl) are mutually exclusive — one provenance per mark. Pick the one that matches how the evidence was obtained.",
+      );
+    }
+    if ((observed != null) !== (verdict != null)) {
+      return fail(
+        "observed and verdict must be provided together (both or neither) — an attested observation needs its verdict, and a verdict needs what was observed.",
+      );
     }
     // Stricter contract (matches the CLI): assertText needs a selector to name
     // WHICH element's text is checked — a whole-page-body match is weak evidence.
@@ -2112,23 +2556,26 @@ server.tool(
       );
     }
     const session = activeSession;
-    const { note, assertion, aborted, observedDriftSec } = await applyMark(session, text, {
+    const { note, assertion, attestation, aborted, observedDriftSec } = await applyMark(session, text, {
       atSeconds,
       assertSelector,
       assertText,
       assertUrl,
       failMode,
+      observed,
+      verdict,
     });
 
-    if (aborted && assertion) {
+    if (aborted) {
       return ok({
         aborted: true,
         assertionFailed: true,
+        provenance: attestation ? "driver-attested" : "clipy-verified",
         marker: note.text,
         atSeconds: Math.round(note.startMs / 100) / 10,
-        expected: assertion.expected,
-        observed: assertion.observed,
-        note: "ASSERTION FAILED and failMode was 'abort' — the recording session was DISCARDED. Nothing was uploaded.",
+        ...(assertion ? { expected: assertion.expected, observed: assertion.observed } : {}),
+        ...(attestation ? { observed: attestation.observed, verdict: attestation.verdict } : {}),
+        note: "FAILED outcome and failMode was 'abort' — the recording session was DISCARDED. Nothing was uploaded.",
       });
     }
 
@@ -2137,8 +2584,27 @@ server.tool(
       text: note.text,
       ...(assertion
         ? assertion.status === "unverified"
-          ? { assertion: { verified: false, unverified: true, observed: assertion.observed }, unverified: true }
-          : { assertion: { passed: assertion.status === "passed", observed: assertion.observed } }
+          ? {
+              assertion: { provenance: "clipy-verified", verified: false, unverified: true, observed: assertion.observed },
+              unverified: true,
+            }
+          : {
+              assertion: {
+                provenance: "clipy-verified",
+                passed: assertion.status === "passed",
+                observed: assertion.observed,
+              },
+            }
+        : {}),
+      ...(attestation
+        ? {
+            attestation: {
+              provenance: "driver-attested",
+              passed: attestation.verdict === "pass",
+              observed: attestation.observed,
+              note: "Clipy vouches that you REPORTED this — it did not verify it. Falsifiable against the recorded frames.",
+            },
+          }
         : {}),
       // Surface when a backdated mark's assertion was observed at a different
       // time than the mark position, so the caller knows the verdict is about

@@ -105,9 +105,9 @@ or the Windsurf MCP config) directly:
 | `download_recording` | Download the MP4 locally so you can clip it or extract frames yourself (e.g. with ffmpeg). |
 | `get_key_moments` | Key moments: timestamps, captions, and click coordinates. |
 | `get_agent_context` | The full agent-context bundle (summary + key moments + transcript) as markdown. |
-| `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts a `type` (recording kind), `viewports` (sweep several screen sizes into one video), `storageState`/`userDataDir`/`initScript` (record behind a login), and timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
-| `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Accepts `type`, `storageState`/`userDataDir`/`initScript`, and `exposeCdp` (get a CDP endpoint + in-page `window.__clipyMark`/`window.__clipyChapter` bridge to drive the recorded page). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
-| `add_marker` | Drop a narration marker into the active session (live clock, or backdate with `atSeconds`) — markers become the recording's transcript chapters. Can also **verify** on-screen state (`assertSelector` / `assertText` (requires a selector) / `assertUrl`, `failMode`); an assertion is annotated as a pass (✓), an explicit failure (✗, can abort the session), or **unverified** (⚠, when it couldn't be evaluated — never a silent pass). Navigations + console errors are added automatically as `[auto]` marks. |
+| `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts a `type` (recording kind), `viewports` (sweep several screen sizes into one video), `storageState` / `userDataDir`+`profileDirectory` / `initScript` (record behind a login), and timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
+| `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Accepts `type`, `storageState` / `userDataDir`+`profileDirectory` / `initScript`, and `exposeCdp` (get a CDP endpoint + in-page `window.__clipyMark`/`window.__clipyChapter` bridge to drive the recorded page). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
+| `add_marker` | Drop a narration marker into the active session (live clock, or backdate with `atSeconds`) — markers become the recording's transcript chapters. Can carry evidence in one of two provenances: **clipy-verified** (`assertSelector` / `assertText` / `assertUrl`) where Clipy checks the page itself, or **driver-attested** (`observed` + `verdict`) where you report what your own tooling saw. Outcomes render as a pass (✓), an explicit failure (✗, can abort via `failMode`), or **unverified** (⚠, never a silent pass), and are tallied in separate segments. Navigations + console errors are added automatically as `[auto]` marks. |
 | `add_chapter` | Drop a `=== CHAPTER: <label> ===` boundary into the active session — split a recording into named sections (ideal for before/after demos). |
 | `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
 | `abort_recording` | Discard the active session; nothing is uploaded. |
@@ -143,11 +143,52 @@ logged), `notes`, and `width`/`height` (default 1280×720, ignored when `viewpor
 
 **Recording behind a login.** `storageState` seeds exactly what its JSON contains (cookies +
 localStorage) but can't reproduce a whole browser identity (IndexedDB, service workers, some
-cross-origin auth). For a full identity, produce a storageState with an interactive login
-(`npx playwright open --save-storage=state.json <login-url>`) and pass its path, **or** pass
-`userDataDir` pointed at a **dedicated** Chromium profile directory — one no running browser
-is using (a live/locked profile is refused). `storageState` and `userDataDir` are mutually
-exclusive.
+cross-origin auth). For a full identity, pass `userDataDir` — Chrome's **user-data root**
+(macOS: `~/Library/Application Support/Google/Chrome`) — in one of two modes:
+
+- **Copy a named profile (recommended).** Add `profileDirectory` (`"Profile 1"`, `"Default"`, …
+  — the exact folder from `chrome://version` → *Profile Path*). Clipy **copies** that profile
+  into a temporary root and records the copy, so your real profile is never opened or modified
+  and the copy is deleted after upload. The tool result discloses the copy (profile name, bytes,
+  and a warning if Chrome was running while it was copied).
+
+  > ⚠️ **macOS: cookie logins may not survive the copy.** Chrome encrypts cookies with the
+  > *Chrome Safe Storage* Keychain key; the recorder's bundled Chromium looks for *Chromium Safe
+  > Storage*. So on macOS a copied profile can produce a browser that **looks like your identity
+  > but is silently logged out** wherever the session is cookie-based — `localStorage`/
+  > `Preferences`-based sessions still work. This is a pre-existing Playwright-vs-Chrome
+  > constraint, not something the copy introduces, and the copy disclosure repeats it. **If the
+  > recording lands logged out, that's why.** Record the real browser with the CLI's
+  > `clipy record --source mac-screen`, or drive your own browser and attach evidence via
+  > `add_marker`'s `observed`/`verdict`.
+- **Open the `Default` profile directly.** Omit `profileDirectory`. Clipy opens the root's
+  `Default` profile **and writes to it**, so it's refused while a live Chrome holds it locked —
+  quit Chrome first. When the dir looks like a real Chrome root, the result carries a
+  `userDataDirWarning` saying so and pointing you at `profileDirectory` (ephemeral copy) or the
+  CLI's `--source mac-screen` instead. Prefer those unless you specifically want in-place use.
+
+> Playwright **strips** Chromium's `--profile-directory` (it always loads `Default` from whatever
+> dir it's given), so copying is the only way to record a named profile. Pointing `userDataDir`
+> at a profile subdir (`.../Chrome/Default`) is **refused** — launching from there would silently
+> record a blank, logged-out profile.
+
+`storageState` and `userDataDir` are mutually exclusive; `profileDirectory` requires `userDataDir`.
+
+### Evidence on a marker: two provenances
+
+`add_marker` can carry evidence in exactly one of two provenances — they are tallied and rendered
+separately, never pooled:
+
+| Provenance | How | What it means |
+| --- | --- | --- |
+| **clipy-verified** | `assertSelector` / `assertText` / `assertUrl` | Clipy checked the recorded page itself. Strongest evidence. Renders `[assert ✓ verified-by-clipy; …]`, or `[ASSERT ✗ verified-by-clipy; …]`, or `[ASSERT ⚠ clipy could not evaluate — …]` when it couldn't check. |
+| **driver-attested** | `observed` + `verdict` (both required) | *You* report what your own tooling saw. Clipy vouches only that you **said** it — not that it verified it — which is falsifiable against the recorded frames. Renders `[ASSERT ✓ driver-attested; observed=…]`. |
+
+Use **driver-attested** when your agent drives its own browser/tooling while Clipy records (e.g.
+`--source mac-screen` on the CLI) or when there's no Clipy-owned page to assert against. It's
+weaker than clipy-verified but far stronger than plain prose. The transcript's leading
+`[verification]` note segments the two, e.g.
+`[verification] 3 clipy-verified: 2 passed, 1 failed · 2 driver-attested: 2 passed, 0 failed`.
 
 ### Driving the recorded page over CDP (`start_recording` + `exposeCdp: true`)
 
