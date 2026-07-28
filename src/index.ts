@@ -25,6 +25,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { MAX_MARKDOWN_CHARS, sliceArecMarkdown } from "./arecRange.js";
 import { chmodSync, closeSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
@@ -35,7 +36,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.8.6";
+const SERVER_VERSION = "0.9.0";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -93,6 +94,49 @@ async function api(path: string): Promise<Json> {
     throw new Error(msg);
   }
   return body;
+}
+
+/** Same call shape as `api()` but for endpoints that return text/markdown. */
+async function apiText(path: string): Promise<string> {
+  if (!API_KEY) {
+    throw new Error(
+      `Missing CLIPY_API_KEY. Create a free API key at ${API_URL}/settings/api-keys ` +
+        "and set it in your MCP client config, then try again.",
+    );
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let res: Response;
+  try {
+    res = await fetch(`${API_URL}${path}`, {
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        Accept: "text/markdown, text/plain, */*",
+        "User-Agent": `clipy-mcp/${SERVER_VERSION}`,
+      },
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if ((e as Error).name === "AbortError") {
+      throw new Error(`Clipy API request timed out after ${FETCH_TIMEOUT_MS / 1000}s`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    // Errors come back as JSON even from the markdown route.
+    let msg = `Clipy API error ${res.status}`;
+    try {
+      const body = JSON.parse(text) as Json;
+      if (typeof body.error === "string") msg = body.error;
+    } catch {
+      /* keep the status-based message */
+    }
+    throw new Error(msg);
+  }
+  return text;
 }
 
 // ---------------------------------------------------------------------------
@@ -2784,6 +2828,152 @@ server.tool(
     try {
       await finishSession(activeSession, "abort");
       return ok({ aborted: true, note: "Session discarded — nothing was uploaded." });
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// Context documents — the user's memory of videos Clipy did NOT record
+// (YouTube imports, local video files). Read-only; separate library from
+// recordings, with its own ids.
+// ---------------------------------------------------------------------------
+
+const contextDocIdSchema = z
+  .string()
+  .describe("The context document's public id (or internal id), as returned by list_context_documents.");
+
+server.tool(
+  "list_context_documents",
+  "List the user's context documents — their imported/watched-video memory: YouTube videos and local video files they imported into Clipy so agents can read them. This is a SEPARATE library from the user's own screen recordings (use list_recordings/search_recordings for those). Returns compact metadata only; call read_context_document for the transcript.",
+  {
+    query: z
+      .string()
+      .optional()
+      .describe("Keywords to match against title and transcript text."),
+    tag: z.string().optional().describe("Filter to documents carrying this tag."),
+    limit: z.number().int().min(1).max(100).optional().describe("Max results (default 25)."),
+  },
+  async ({ query, tag, limit }) => {
+    try {
+      const params = new URLSearchParams();
+      if (query) params.set("q", query);
+      if (tag) params.set("tag", tag);
+      if (limit) params.set("limit", String(limit));
+      const qs = params.toString();
+      const body = await api(`/api/v1/context-documents${qs ? `?${qs}` : ""}`);
+      const docs = Array.isArray(body.documents) ? (body.documents as Json[]) : [];
+      return ok({
+        documents: docs.map((d) => ({
+          publicId: d.publicId,
+          title: d.title,
+          sourceKind: d.sourceKind,
+          sourceUrl: d.sourceUrl,
+          durationMs: d.durationMs,
+          language: d.language,
+          tags: d.tags,
+          segmentCount: d.segmentCount,
+          frameCount: d.frameCount,
+          ingestStatus: d.ingestStatus,
+          createdAt: d.createdAt,
+        })),
+        pagination: body.pagination,
+      });
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "get_context_document",
+  "Get one context document's metadata: source (YouTube URL or local file), duration, tags, its server-side classification (video type, whether visual evidence is needed, planned moments), and what transcript/frames are available. Deliberately does NOT return the transcript — call read_context_document for that.",
+  { id: contextDocIdSchema },
+  async ({ id }) => {
+    try {
+      const body = await api(`/api/v1/context-documents/${encodeURIComponent(id.trim())}`);
+      const doc = (body.document ?? {}) as Json;
+      const transcript = (doc.transcript ?? {}) as Json;
+      const segments = Array.isArray(transcript.segments) ? transcript.segments : [];
+      const plaintext = typeof transcript.plaintext === "string" ? transcript.plaintext : "";
+      const markdown = typeof doc.arecMarkdown === "string" ? doc.arecMarkdown : "";
+      const artifacts = Array.isArray(doc.artifacts) ? (doc.artifacts as Json[]) : [];
+      return ok({
+        publicId: doc.publicId,
+        title: doc.title,
+        sourceKind: doc.sourceKind,
+        source: doc.source,
+        durationMs: doc.durationMs,
+        language: doc.language,
+        profile: doc.profile,
+        tags: doc.tags,
+        ingestStatus: doc.ingestStatus,
+        createdAt: doc.createdAt,
+        updatedAt: doc.updatedAt,
+        classification: doc.classification,
+        sufficiency: doc.sufficiency,
+        transcript: {
+          source: transcript.source,
+          language: transcript.language,
+          segmentCount: segments.length,
+          plaintextChars: plaintext.length,
+          available: segments.length > 0 || plaintext.length > 0,
+        },
+        frames: artifacts.map((a) => ({
+          id: a.id,
+          kind: a.kind,
+          timestampMs: a.timestampMs,
+          caption: a.caption,
+        })),
+        markdownChars: markdown.length,
+        hint: "Read the document with read_context_document; pass startMs/endMs on long videos.",
+      });
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "read_context_document",
+  "Read a context document as compiled markdown: header + metadata, then the timestamped transcript (with frame captions interleaved). Pass startMs/endMs to read only the part of a long video you care about — the document is sectioned roughly every 150s and only sections overlapping your range come back, so you can walk a two-hour video without flooding your context.",
+  {
+    id: contextDocIdSchema,
+    startMs: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Start of the span to read, in milliseconds into the video."),
+    endMs: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("End of the span to read, in milliseconds. Omit for 'to the end'."),
+  },
+  async ({ id, startMs, endMs }) => {
+    if (startMs !== undefined && endMs !== undefined && endMs <= startMs) {
+      return fail("endMs must be greater than startMs");
+    }
+    try {
+      const markdown = await apiText(
+        `/api/v1/context-documents/${encodeURIComponent(id.trim())}/recording.md`,
+      );
+      const sliced = sliceArecMarkdown(markdown, { startMs, endMs }, MAX_MARKDOWN_CHARS);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              sliced.markdown +
+              (sliced.sectionsTotal > sliced.sectionsReturned
+                ? `\n\n[Showing ${sliced.sectionsReturned} of ${sliced.sectionsTotal} transcript sections for the requested range.]\n`
+                : ""),
+          },
+        ],
+      };
     } catch (e) {
       return fail((e as Error).message);
     }

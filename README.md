@@ -111,6 +111,9 @@ or the Windsurf MCP config) directly:
 | `add_chapter` | Drop a `=== CHAPTER: <label> ===` boundary into the active session — split a recording into named sections (ideal for before/after demos). |
 | `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
 | `abort_recording` | Discard the active session; nothing is uploaded. |
+| `list_context_documents` | List the user's **context documents** — YouTube videos and local video files they imported with `clipy context import`, so agents can read them. A separate library from their own screen recordings. |
+| `get_context_document` | One context document's metadata: source, duration, tags, the server's classification (video type, whether visual evidence is needed, planned moments), and which transcript/frames exist. Not the transcript itself. |
+| `read_context_document` | Read a context document as compiled markdown — header, metadata, then the timestamped transcript with frame captions interleaved. Takes `startMs`/`endMs` so you can walk a two-hour video section by section instead of flooding your context. |
 | `replace_transcript` | **Replace a recording's transcript** with text you author (needs the `ingest` scope). Fix a bad speech-to-text pass, translate, or enrich a silent agent capture; the summary regenerates automatically. Marked as agent-edited, never passed off as speech-to-text. |
 
 Read tools accept a recording's **public id** (the slug in its share URL) or the full
