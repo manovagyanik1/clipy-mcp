@@ -36,7 +36,7 @@ import { pipeline } from "node:stream/promises";
 
 const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.9.1";
+const SERVER_VERSION = "0.10.0";
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
@@ -1110,6 +1110,37 @@ function normalizeId(input: string): string {
   }
   return trimmed;
 }
+
+server.tool(
+  "search_memory",
+  "Search EVERYTHING in the user's Clipy memory at once — every screen recording they made AND every video they imported or watched (YouTube, local files) — and get back the exact moments that match, with timestamps. This is the tool to reach for first when the user refers to something they 'showed you', 'recorded', 'watched', or 'went over'; the per-library tools (search_recordings, list_context_documents) only see half the picture. Matching is semantic as well as literal: 'login flow' finds a moment where someone said 'the authentication screen'. Each result carries kind ('recording' or 'context'), the title, startMs, a plain-text snippet of what was said, and a URL that opens at that moment. Read next: get_transcript or get_recording for a 'recording' hit, read_context_document for a 'context' hit — pass the result's publicId. Read `semantic.status` before trusting an empty result: 'ok' means the search ran fully (so nothing found really does mean nothing recorded), while 'unavailable' or 'failed' means the semantic index did not run and these are KEYWORD-ONLY results — say so rather than concluding the user has nothing on the topic, and retry with more literal phrasings. Each hit's `resolution` says how precise its timestamp is: 'lexical' and 'refined' are exact moments, 'window' means startMs..endMs is a ~50-second SPAN to look in rather than a precise point, and 'document' means the match is about the whole recording and has no timestamp — do not quote a window or document hit as an exact time.",
+  {
+    query: z
+      .string()
+      .min(3)
+      .max(512)
+      .describe(
+        "What to look for, in natural language — a topic, phrase, or thing that was said or shown. 3-512 characters.",
+      ),
+    kinds: z
+      .array(z.enum(["recording", "context"]))
+      .optional()
+      .describe(
+        "Restrict the search: 'recording' = the user's own screen recordings, 'context' = imported/watched videos. Omit to search both, which is usually right.",
+      ),
+    limit: z.number().int().min(1).max(50).optional().describe("Max results (default 20)."),
+  },
+  async ({ query, kinds, limit }) => {
+    try {
+      const params = new URLSearchParams({ q: query });
+      if (kinds && kinds.length > 0) params.set("kinds", kinds.join(","));
+      if (limit) params.set("limit", String(limit));
+      return ok(await api(`/api/v1/search?${params.toString()}`));
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
 
 server.tool(
   "search_recordings",
