@@ -13,6 +13,10 @@ recording into a Linear ticket"_ without leaving your agent — and, with the `r
 tool, **record a web app headlessly** and get it back as a Clipy recording (_"build the
 feature, then record the outcome"_).
 
+The canonical cross-surface operating contract is
+**[clipy.online/agents.md](https://clipy.online/agents.md)**. For the exact
+connected MCP version and schemas, use the standard `tools/list` request.
+
 The read tools need the `recordings:read` scope, which every key gets by default. The
 write tools — `record`, the session tools (`start_recording`, `add_marker`, `add_chapter`,
 `stop_recording`, `abort_recording`), and `replace_transcript` — additionally need the
@@ -96,6 +100,7 @@ or the Windsurf MCP config) directly:
 
 | Tool | What it does |
 | --- | --- |
+| `search_memory` | **Search the whole Clipy memory at once** — every screen recording the user made *and* every video they imported — returning the matching moments with timestamps and a URL that opens at that point. Matching is semantic as well as literal, so "login flow" finds a moment where someone said "the authentication screen". Reach for this first when the user refers to something they showed, recorded, or watched; the per-library tools below each see only half the picture. Each hit carries `kind` (`recording` or `context`) to tell you which tool to read next, a `resolution` saying whether its timestamp is an exact moment or a ~50s span, and a `semantic.status` to check before treating an empty result as "nothing recorded". |
 | `search_recordings` | Search your recordings by keyword (title + description). |
 | `list_recordings` | List your most recent recordings. |
 | `get_recording` | Metadata for one recording (status, duration, transcript/summary status). |
@@ -111,7 +116,6 @@ or the Windsurf MCP config) directly:
 | `add_chapter` | Drop a `=== CHAPTER: <label> ===` boundary into the active session — split a recording into named sections (ideal for before/after demos). |
 | `stop_recording` | Finish the session: close the browser, upload, return the share + agent-context URLs. |
 | `abort_recording` | Discard the active session; nothing is uploaded. |
-| `search_memory` | **Search the whole Clipy memory at once** — every screen recording the user made *and* every video they imported — returning the matching moments with timestamps and a URL that opens at that point. Matching is semantic as well as literal, so "login flow" finds a moment where someone said "the authentication screen". Reach for this first when the user refers to something they showed, recorded, or watched; the per-library tools below each see only half the picture. Each hit carries `kind` (`recording` or `context`) to tell you which tool to read next, a `resolution` saying whether its timestamp is an exact moment or a ~50s span, and a `semantic.status` to check before treating an empty result as "nothing recorded". |
 | `list_context_documents` | List the user's **context documents** — YouTube videos and local video files they imported with `clipy context import`, so agents can read them. A separate library from their own screen recordings. |
 | `get_context_document` | One context document's metadata: source, duration, tags, the server's classification (video type, whether visual evidence is needed, planned moments), and which transcript/frames exist. Not the transcript itself. |
 | `read_context_document` | Read a context document as compiled markdown — header, metadata, then the timestamped transcript with frame captions interleaved. Takes `startMs`/`endMs` so you can walk a two-hour video section by section instead of flooding your context. |
