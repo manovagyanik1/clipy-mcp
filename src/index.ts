@@ -17,9 +17,15 @@
  * ("Record & upload"), enforced server-side. A `recordings:read`-only key cannot
  * create, modify, or delete anything.
  *
- * Config (env):
- *   CLIPY_API_KEY   (required)  your personal key
- *   CLIPY_API_URL   (optional)  base URL, defaults to https://clipy.online
+ * Config, in precedence order:
+ *   CLIPY_API_KEY / CLIPY_API_URL          env vars
+ *   ~/.config/clipy/config.json            written by `clipy login`
+ *   https://clipy.online                   default base URL
+ *
+ * Reading the CLI's config file is what lets an agent finish setup on its own:
+ * `clipy login` is the only step that needs a human, and after it the MCP
+ * server can be registered with no secret on the command line or in the host's
+ * MCP config. Mirrors the CLI's own store (cli/src/index.ts `configPath`).
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -29,22 +35,52 @@ import { MAX_MARKDOWN_CHARS, sliceArecMarkdown } from "./arecRange.js";
 import { chmodSync, closeSync, cpSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
-const API_URL = (process.env.CLIPY_API_URL || "https://clipy.online").replace(/\/+$/, "");
-const API_KEY = process.env.CLIPY_API_KEY;
-const SERVER_VERSION = "0.11.0";
+/** `clipy login`'s credential store. Same path the CLI computes. */
+function cliConfigPath(): string {
+  const base = process.env.XDG_CONFIG_HOME?.trim() || join(homedir(), ".config");
+  return join(base, "clipy", "config.json");
+}
+
+function readCliConfig(): { apiKey?: string; apiUrl?: string } {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(cliConfigPath(), "utf8"));
+    if (!parsed || typeof parsed !== "object") return {};
+    const { apiKey, apiUrl } = parsed as Record<string, unknown>;
+    return {
+      apiKey: typeof apiKey === "string" && apiKey ? apiKey : undefined,
+      apiUrl: typeof apiUrl === "string" && apiUrl ? apiUrl : undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+const CLI_CONFIG = readCliConfig();
+const API_URL = (process.env.CLIPY_API_URL || CLI_CONFIG.apiUrl || "https://clipy.online").replace(/\/+$/, "");
+const API_KEY = process.env.CLIPY_API_KEY || CLI_CONFIG.apiKey;
+const API_KEY_SOURCE = process.env.CLIPY_API_KEY ? "env CLIPY_API_KEY" : CLI_CONFIG.apiKey ? cliConfigPath() : null;
+const SERVER_VERSION = "0.12.0";
+
+/** Every keyless failure points at the same two fixes, cheapest one first. */
+const MISSING_KEY_MESSAGE =
+  `No Clipy credential. Run \`clipy login\` in a terminal — it writes ${cliConfigPath()}, which this server reads — ` +
+  `or mint a key at ${API_URL}/settings/api-keys and set CLIPY_API_KEY in your MCP client config. ` +
+  "The credential is read at startup, so restart the MCP client afterwards.";
+const MISSING_INGEST_KEY_MESSAGE = `${MISSING_KEY_MESSAGE} This tool additionally needs the key to carry the "ingest" scope.`;
 
 // The key is checked lazily (per tool call, not at startup) so the server can
 // start and answer introspection (initialize / tools/list) in keyless
 // environments like directory health checks.
 if (!API_KEY) {
   process.stderr.write(
-    "[clipy-mcp] CLIPY_API_KEY is not set — tools will error until it is. " +
-      `Create one at ${API_URL}/settings/api-keys and set it in your MCP client config.\n`,
+    "[clipy-mcp] no Clipy credential found — tools will error until there is one. " +
+      `Run \`clipy login\` (writes ${cliConfigPath()}, which this server reads), ` +
+      `or mint a key at ${API_URL}/settings/api-keys and set CLIPY_API_KEY.\n`,
   );
 }
 
@@ -65,7 +101,7 @@ function actionableApiError(status: number, message: string, path: string): stri
     : "No recording with that id. Call list_recordings or search_recordings first and use a publicId from those results.";
   switch (status) {
     case 401:
-      return `${message} (HTTP 401 — CLIPY_API_KEY is missing, invalid, or revoked.) Fix it, then retry: run \`clipy login\` in a terminal to approve this device, or mint a key at ${API_URL}/settings/api-keys and set CLIPY_API_KEY in your MCP client config (the server reads it at startup, so restart the client after changing it). Retrying this call unchanged will fail identically.`;
+      return `${message} (HTTP 401 — the Clipy credential ${API_KEY_SOURCE ? `read from ${API_KEY_SOURCE}` : "is missing and"} is invalid, expired, or revoked.) Fix it, then retry: run \`clipy login\` in a terminal to approve this device (it writes ${cliConfigPath()}, which this server reads), or mint a key at ${API_URL}/settings/api-keys and set CLIPY_API_KEY in your MCP client config. Either way the credential is read at startup, so restart the MCP client afterwards. Retrying this call unchanged will fail identically.`;
     case 403:
       return `${message} (HTTP 403 — the API key is valid but lacks the scope this call needs, or the resource belongs to another account.) Write tools need a key with the "ingest" permission; mint one at ${API_URL}/settings/api-keys. Retrying with the same key cannot succeed.`;
     case 404:
@@ -84,10 +120,7 @@ function actionableApiError(status: number, message: string, path: string): stri
 /** Calls the Clipy v1 API with the API key. Throws on non-2xx or timeout. */
 async function api(path: string): Promise<Json> {
   if (!API_KEY) {
-    throw new Error(
-      `Missing CLIPY_API_KEY. Create a free API key at ${API_URL}/settings/api-keys ` +
-        "and set it in your MCP client config, then try again.",
-    );
+    throw new Error(MISSING_KEY_MESSAGE);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -128,10 +161,7 @@ async function api(path: string): Promise<Json> {
 /** Same call shape as `api()` but for endpoints that return text/markdown. */
 async function apiText(path: string): Promise<string> {
   if (!API_KEY) {
-    throw new Error(
-      `Missing CLIPY_API_KEY. Create a free API key at ${API_URL}/settings/api-keys ` +
-        "and set it in your MCP client config, then try again.",
-    );
+    throw new Error(MISSING_KEY_MESSAGE);
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -175,7 +205,7 @@ async function apiText(path: string): Promise<string> {
 
 /** POST/PUT JSON to a write endpoint. Retries transient failures; throws on hard errors. */
 async function apiPostJson(path: string, payload: unknown, method: "POST" | "PUT" = "POST"): Promise<Json> {
-  if (!API_KEY) throw new Error(`Missing CLIPY_API_KEY. Create one at ${API_URL}/settings/api-keys.`);
+  if (!API_KEY) throw new Error(MISSING_KEY_MESSAGE);
   for (let attempt = 1; attempt <= 4; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -234,7 +264,7 @@ async function apiPostChunk(
   partNumber: number,
   bytes: Uint8Array,
 ): Promise<void> {
-  if (!API_KEY) throw new Error("Missing CLIPY_API_KEY.");
+  if (!API_KEY) throw new Error(MISSING_KEY_MESSAGE);
   for (let attempt = 1; attempt <= 4; attempt++) {
     const part = bytes.slice().buffer as ArrayBuffer;
     const form = new FormData();
@@ -1768,7 +1798,7 @@ server.tool(
       return fail(`url must be http(s), got ${target.protocol}`);
     }
     if (!API_KEY) {
-      return fail(`Missing CLIPY_API_KEY. Create an ingest-scoped key at ${API_URL}/settings/api-keys.`);
+      return fail(MISSING_INGEST_KEY_MESSAGE);
     }
 
     // Validate the structured inputs before touching a browser so an agent gets
@@ -2162,7 +2192,7 @@ server.tool(
       return fail(`url must be http(s), got ${target.protocol}`);
     }
     if (!API_KEY) {
-      return fail(`Missing CLIPY_API_KEY. Create an ingest-scoped key at ${API_URL}/settings/api-keys.`);
+      return fail(MISSING_INGEST_KEY_MESSAGE);
     }
     if (activeSession) {
       return fail(

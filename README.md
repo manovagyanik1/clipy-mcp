@@ -26,31 +26,17 @@ delete anything.
 
 ## Setup
 
-This is a headless server process, so it authenticates with a Clipy API key in the
-`CLIPY_API_KEY` env var (it looks like `clipy_sk_live_…`). The easiest way to get one is
-the Clipy CLI's browser login:
+Log in once with the Clipy CLI:
 
 ```bash
 npx @clipy/cli@latest login
 ```
 
 It opens your browser; click **Approve** once. The key is saved to
-`~/.config/clipy/config.json` — copy its `apiKey` value into `CLIPY_API_KEY` when you add
-the server below.
-
-**Prefer to mint one by hand?** Create a key at
-**https://clipy.online/settings/api-keys** instead (it's shown only once — copy it
-immediately).
+`~/.config/clipy/config.json`, **and this server reads that file** — so there is no key to
+copy anywhere, and no secret ends up in your shell history or your MCP config.
 
 Then add the server to your MCP client.
-
-> **Never inline your key into the server's launch command** — e.g.
-> `"command": "sh", "args": ["-c", "CLIPY_API_KEY=… npx -y @clipy/mcp"]`. Command-line
-> arguments are visible to **every local process** via the process table (`ps`, `/proc`),
-> so a key placed there is effectively world-readable on the machine. Always put it in the
-> `env` block, exactly as every example below does. (The one-time `claude mcp add --env …` /
-> `codex mcp add --env …` helpers below write that `env` block for you — they expose the key
-> only in the argv of that single setup command, never in the long-running server's.)
 
 ### Claude Code
 
@@ -58,7 +44,7 @@ The `--scope user` flag installs Clipy **globally** for every project. Without i
 `claude mcp add` defaults to `local` scope (the current folder only):
 
 ```bash
-claude mcp add --scope user clipy --env CLIPY_API_KEY=clipy_sk_live_xxx -- npx -y @clipy/mcp
+claude mcp add --scope user clipy -- npx -y @clipy/mcp
 ```
 
 ### Codex
@@ -67,7 +53,7 @@ This writes the server to your global `~/.codex/config.toml`, so it's available 
 Codex session:
 
 ```bash
-codex mcp add clipy --env CLIPY_API_KEY=clipy_sk_live_xxx -- npx -y @clipy/mcp
+codex mcp add clipy -- npx -y @clipy/mcp
 ```
 
 Or add it to `~/.codex/config.toml` by hand:
@@ -76,7 +62,6 @@ Or add it to `~/.codex/config.toml` by hand:
 [mcp_servers.clipy]
 command = "npx"
 args = ["-y", "@clipy/mcp"]
-env = { CLIPY_API_KEY = "clipy_sk_live_xxx" }
 ```
 
 ### Claude Desktop / Cursor / Windsurf
@@ -89,12 +74,29 @@ or the Windsurf MCP config) directly:
   "mcpServers": {
     "clipy": {
       "command": "npx",
-      "args": ["-y", "@clipy/mcp"],
-      "env": { "CLIPY_API_KEY": "clipy_sk_live_xxx" }
+      "args": ["-y", "@clipy/mcp"]
     }
   }
 }
 ```
+
+Add an `"env": { "CLIPY_API_KEY": "clipy_sk_live_xxx" }` block only if you are not using
+`clipy login` on this machine.
+
+### Setting the key explicitly
+
+Use `CLIPY_API_KEY` when there is no `clipy login` to read from — CI, a container — or
+when you deliberately want a different key than the logged-in one. An explicit env var
+always wins over the config file. Mint keys at
+**https://clipy.online/settings/api-keys** (shown only once).
+
+> **Never inline your key into the server's launch command** — e.g.
+> `"command": "sh", "args": ["-c", "CLIPY_API_KEY=… npx -y @clipy/mcp"]`. Command-line
+> arguments are visible to **every local process** via the process table (`ps`, `/proc`),
+> so a key placed there is effectively world-readable on the machine. Put it in the `env`
+> block instead. (`claude mcp add --env …` / `codex mcp add --env …` write that `env` block
+> for you — they expose the key only in the argv of that single setup command, never in the
+> long-running server's.)
 
 ## Tools
 
@@ -264,7 +266,7 @@ await page.evaluate(() => window.__clipyChapter("AFTER — fix applied"));
 
 | Env var | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `CLIPY_API_KEY` | yes | — | Your personal key from `/settings/api-keys`. |
+| `CLIPY_API_KEY` | no | `apiKey` from `~/.config/clipy/config.json` | Your personal key from `/settings/api-keys`. Set it only when `clipy login` has not run on this machine; when set it overrides the config file. |
 | `CLIPY_API_URL` | no | `https://clipy.online` | Override for self-hosted/staging. |
 
 ## Privacy
