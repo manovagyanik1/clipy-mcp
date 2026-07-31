@@ -20,8 +20,8 @@
       "environmentVariables": [
         {
           "name": "CLIPY_API_KEY",
-          "description": "Clipy API key — create one free at https://clipy.online/settings/api-keys",
-          "isRequired": true,
+          "description": "Clipy API key. Optional — the server reads the credential `clipy login` stores at ~/.config/clipy/config.json. Set this to override it, or for CI where there is no login. Create a key free at https://clipy.online/settings/api-keys",
+          "isRequired": false,
           "format": "string",
           "isSecret": true
         },
