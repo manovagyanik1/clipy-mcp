@@ -1,6 +1,7 @@
 name: Publish
 
-# Publishes @clipy/mcp to npm when a tag matching `v*` is pushed.
+# Publishes @clipy/mcp to npm when a tag matching `v*` is pushed, then updates
+# the server's listing in the official MCP Registry.
 # Inert until the NPM_TOKEN secret is set on this repository.
 
 on:
@@ -25,3 +26,47 @@ jobs:
       - run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # The MCP Registry (registry.modelcontextprotocol.io) is a public
+      # discovery listing that POINTS AT the npm package — it hosts no code, so
+      # it can only be updated once npm already serves this version. Before
+      # this step existed the listing was updated by hand and silently fell a
+      # version behind.
+      #
+      # Namespace auth is domain ownership: `online.clipy` is the reverse-DNS
+      # of clipy.online, proven by signing a challenge with the ed25519 key
+      # whose public half is served at
+      # https://clipy.online/.well-known/mcp-registry-auth. GitHub OIDC cannot
+      # be used instead — it only authorizes `io.github.*` namespaces, because
+      # it proves who owns the *repo*, not who owns the *domain*. Hence the
+      # stored key.
+      #
+      # If this step ever fails with a namespace error, check that the deployed
+      # well-known file matches the public half of MCP_REGISTRY_KEY. Rotating
+      # one without the other breaks publishing.
+      - name: Publish to the MCP Registry
+        env:
+          MCP_REGISTRY_KEY: ${{ secrets.MCP_REGISTRY_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MCP_REGISTRY_KEY:-}" ]; then
+            echo "MCP_REGISTRY_KEY is not set — skipping the registry listing." >&2
+            echo "npm published fine; the listing will be one version behind." >&2
+            exit 0
+          fi
+
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz"
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+
+          # npm's registry is read-through cached; the MCP Registry validates
+          # that the package version resolves before it will accept the entry.
+          VERSION="$(node -p "require('./package.json').version")"
+          for i in 1 2 3 4 5 6; do
+            if npm view "@clipy/mcp@${VERSION}" version >/dev/null 2>&1; then break; fi
+            echo "waiting for @clipy/mcp@${VERSION} to appear on npm (attempt $i)…"
+            sleep 10
+          done
+
+          ./mcp-publisher login http --domain clipy.online --private-key "$MCP_REGISTRY_KEY"
+          ./mcp-publisher publish
