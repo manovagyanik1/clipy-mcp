@@ -64,7 +64,7 @@ const CLI_CONFIG = readCliConfig();
 const API_URL = (process.env.CLIPY_API_URL || CLI_CONFIG.apiUrl || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY || CLI_CONFIG.apiKey;
 const API_KEY_SOURCE = process.env.CLIPY_API_KEY ? "env CLIPY_API_KEY" : CLI_CONFIG.apiKey ? cliConfigPath() : null;
-const SERVER_VERSION = "0.12.0";
+const SERVER_VERSION = "0.13.0";
 
 /** Every keyless failure points at the same two fixes, cheapest one first. */
 const MISSING_KEY_MESSAGE =
