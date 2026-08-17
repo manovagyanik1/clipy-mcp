@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Offline selftest for AREC range slicing (no network, no API key).
- * Run after `npm run build` — it imports the compiled module.
+ * Run after `pnpm run build` — it imports the compiled module.
  */
 import assert from "node:assert/strict";
 import { dirname, join } from "node:path";

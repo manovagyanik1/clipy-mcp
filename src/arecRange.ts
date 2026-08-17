@@ -1,5 +1,5 @@
 /**
- * Range slicing for compiled AREC markdown (`recording.md`).
+ * Range slicing for compiled AREC markdown (`recording.arec`).
  *
  * The compiler emits a header block (title, metadata, visual gaps, frames)
  * followed by `## Transcript` and then one `### MM:SS` heading every ~150s,

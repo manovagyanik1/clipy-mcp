@@ -108,10 +108,11 @@ always wins over the config file. Mint keys at
 | `get_recording` | Metadata for one recording (status, duration, transcript/summary status). |
 | `get_transcript` | The full timestamped transcript + plaintext. |
 | `get_summary` | The AI summary: TL;DR, key points, action items. |
+| `get_browser_diagnostics` | Privacy-redacted visited routes, console warnings/errors, page exceptions, and failed fetch/XHR metadata. The evidence is explicitly labelled page-reported; headers, bodies, cookies, tokens, typed values, and raw query values are never captured. |
 | `wait_for_artifacts` | Poll until a recording's transcript/summary finish processing. |
 | `download_recording` | Download the MP4 locally so you can clip it or extract frames yourself (e.g. with ffmpeg). |
 | `get_key_moments` | Key moments: timestamps, captions, and click coordinates. |
-| `get_agent_context` | The full agent-context bundle (summary + key moments + transcript) as markdown. |
+| `get_agent_context` | The full agent-context bundle (summary + key moments + transcript + available browser diagnostics) as markdown. |
 | `record` | **Record a web app headlessly** and upload it as a Clipy recording; returns its share + agent-context URLs. Accepts a `type` (recording kind), `viewports` (sweep several screen sizes into one video), `storageState` / `userDataDir`+`profileDirectory` / `initScript` (record behind a login), and timestamped `notes` that become the (silent) recording's transcript. Needs Playwright in this server's environment and an `ingest`-scoped key (see below). |
 | `start_recording` | **Start a recording session** that keeps recording while you work (drive the page with your own browser tools, run commands, …). Accepts `type`, `storageState` / `userDataDir`+`profileDirectory` / `initScript`, and `exposeCdp` (get a CDP endpoint + in-page `window.__clipyMark`/`window.__clipyChapter` bridge to drive the recorded page). Auto-stops + uploads at `maxSeconds` (default 600) so it can never run away. |
 | `add_marker` | Drop a narration marker into the active session (live clock, or backdate with `atSeconds`) — markers become the recording's transcript chapters. Can carry evidence in one of two provenances: **clipy-verified** (`assertSelector` / `assertText` / `assertUrl`) where Clipy checks the page itself, or **driver-attested** (`observed` + `verdict`) where you report what your own tooling saw. Clipy-verified outcomes render with a verdict glyph (✓ pass, ✗ failure that can abort via `failMode`, ⚠ unverified — never a silent pass); driver-attested ones render with a weaker-looking **hedge glyph** (`≈`) so the two are never mistaken at a glance, and they are tallied in separate segments. Navigations + console errors are added automatically as `[auto]` marks. |
@@ -121,13 +122,13 @@ always wins over the config file. Mint keys at
 | `list_context_documents` | List the user's **context documents** — YouTube videos and local video files they imported with `clipy context import`, so agents can read them. A separate library from their own screen recordings. |
 | `get_context_document` | One context document's metadata: source, duration, tags, the server's classification (video type, whether visual evidence is needed, planned moments), and which transcript/frames exist. Not the transcript itself. |
 | `read_context_document` | Read a context document as compiled markdown — header, metadata, then the timestamped transcript with frame captions interleaved. Takes `startMs`/`endMs` so you can walk a two-hour video section by section instead of flooding your context. |
-| `replace_transcript` | **Replace a recording's transcript** with text you author (needs the `ingest` scope). Fix a bad speech-to-text pass, translate, or enrich a silent agent capture; the summary regenerates automatically. Marked as agent-edited, never passed off as speech-to-text. |
+| `replace_transcript` | **Replace a recording's transcript** with text you author (needs the `ingest` scope). Call `get_transcript` first and pass its `revision`; stale replacements are rejected instead of overwriting a concurrent edit. The summary regenerates automatically. Marked as agent-edited, never passed off as speech-to-text. |
 
 Read tools accept a recording's **public id** (the slug in its share URL) or the full
 `https://clipy.online/video/<id>` URL.
 
 > **Capturing the real screen is CLI-only.** These tools record a headless Chromium page.
-> To record the actual Mac screen or a specific window (ScreenCaptureKit — the real
+> To record the actual Mac screen or a window's initial screen area (ScreenCaptureKit — the real
 > logged-in browser), use the Clipy CLI: `clipy record --source mac-screen --window "<app>"`.
 
 ### Using `record`
@@ -206,7 +207,7 @@ footage of the wrong thing. **Clipy will never focus or foreground a window or t
 pointing the driver and the camera at the same surface is the caller's job.
 
 `kind` is always `headless_browser` here: these tools record a headless page Clipy owns.
-Capturing a real application window or display is CLI-only
+Capturing a real application's initial screen area or a display is CLI-only
 (`clipy record --source mac-screen --window "<app>"`), so no window id or window title is
 reported — an empty or invented one would be exactly the kind of false confidence this
 field exists to prevent.
