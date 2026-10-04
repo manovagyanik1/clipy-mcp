@@ -66,7 +66,7 @@ const CLI_CONFIG = readCliConfig();
 const API_URL = (process.env.CLIPY_API_URL || CLI_CONFIG.apiUrl || "https://clipy.online").replace(/\/+$/, "");
 const API_KEY = process.env.CLIPY_API_KEY || CLI_CONFIG.apiKey;
 const API_KEY_SOURCE = process.env.CLIPY_API_KEY ? "env CLIPY_API_KEY" : CLI_CONFIG.apiKey ? cliConfigPath() : null;
-const SERVER_VERSION = "0.14.0";
+const SERVER_VERSION = "0.15.0";
 
 /** Every keyless failure points at the same two fixes, cheapest one first. */
 const MISSING_KEY_MESSAGE =
@@ -105,7 +105,7 @@ function actionableApiError(status: number, message: string, path: string): stri
     case 401:
       return `${message} (HTTP 401 — the Clipy credential ${API_KEY_SOURCE ? `read from ${API_KEY_SOURCE}` : "is missing and"} is invalid, expired, or revoked.) Fix it, then retry: run \`clipy login\` in a terminal to approve this device (it writes ${cliConfigPath()}, which this server reads), or mint a key at ${API_URL}/settings/api-keys and set CLIPY_API_KEY in your MCP client config. Either way the credential is read at startup, so restart the MCP client afterwards. Retrying this call unchanged will fail identically.`;
     case 403:
-      return `${message} (HTTP 403 — the API key is valid but lacks the scope this call needs, or the resource belongs to another account.) Write tools need a key with the "ingest" permission; mint one at ${API_URL}/settings/api-keys. Retrying with the same key cannot succeed.`;
+      return `${message} (HTTP 403 — the API key is valid but lacks the scope this call needs, or the resource belongs to another account.) ${/\/edit(\?|$)/.test(path) ? 'Video editing (get_edit_transcript, edit_recording) needs a key with the "recordings:write" permission' : 'Write tools need a key with the "ingest" permission'}; mint one at ${API_URL}/settings/api-keys. Retrying with the same key cannot succeed.`;
     case 404:
       return `${message} (HTTP 404.) ${notFoundHint}`;
     case 429:
@@ -256,8 +256,11 @@ async function apiPostJson(path: string, payload: unknown, method: "POST" | "PUT
       const msg = (typeof body.error === "string" && body.error) || `Clipy API error ${res.status}`;
       if (res.status === 403) {
         throw new Error(
-          `${msg}\nThe record tool needs an API key with the "ingest" permission. ` +
-            `Mint one at ${API_URL}/settings/api-keys (check "Record & upload").`,
+          /\/edit$/.test(path)
+            ? `${msg}\nedit_recording needs an API key with the "recordings:write" permission. ` +
+                `Mint one at ${API_URL}/settings/api-keys.`
+            : `${msg}\nThe record tool needs an API key with the "ingest" permission. ` +
+                `Mint one at ${API_URL}/settings/api-keys (check "Record & upload").`,
         );
       }
       throw new Error(msg);
@@ -1251,6 +1254,86 @@ server.tool(
   async ({ id }) => {
     try {
       return ok(await api(`/api/v1/recordings/${encodeURIComponent(normalizeId(id))}/transcript`));
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "get_edit_transcript",
+  "Read a recording the way edit_recording edits it: every spoken word with its index, start and end in ms on the ORIGINAL recording's timeline, a `filler` flag on hesitations (um, uh, er, hmm), and `removed` on words the current version already cuts. Also returns the current cuts and the revision to pass to edit_recording. Words come in pages of up to 1,500; when transcript.nextFromWord is not null, call again with fromWord. When approximateWordTimings is true, cut whole sentences rather than single words. Needs the 'recordings:write' scope, because it includes the text of words the owner cut.",
+  {
+    id: recordingIdSchema,
+    fromWord: z.number().int().min(0).optional().describe("First word index to return (default 0)."),
+    limit: z.number().int().min(1).max(1500).optional().describe("Words per page (max 1500)."),
+  },
+  async ({ id, fromWord, limit }) => {
+    try {
+      const query = new URLSearchParams();
+      if (fromWord !== undefined) query.set("fromWord", String(fromWord));
+      if (limit !== undefined) query.set("limit", String(limit));
+      const qs = query.toString();
+      return ok(await api(`/api/v1/recordings/${encodeURIComponent(normalizeId(id))}/edit${qs ? `?${qs}` : ""}`));
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+  },
+);
+
+server.tool(
+  "edit_recording",
+  "Cut parts of a recording's video by its transcript (a fumbled sentence, a tangent, dead air, or every filler word). Needs the 'recordings:write' scope. Word indexes and ms times come from get_edit_transcript and are on the ORIGINAL timeline; operations apply on top of the current cuts in this order: restoreOriginal, removeWords, removeRanges, removeFillerWords, restoreWords, restoreRanges. autoZoom: true zooms in on recorded clicks (Mac and Windows recordings). Clipy keeps the original, so a cut can be brought back unless the owner deletes the original; the transcript is generated again after each edit, replacing hand corrections. The share link stays the same and switches to the new version when rendering finishes; transcript, summary and key moments then regenerate. Run with dryRun first, show the user removedWords, and confirm before editing a recording others may be watching.",
+  {
+    id: recordingIdSchema,
+    removeWords: z
+      .array(
+        z.object({
+          from: z.number().int().min(0),
+          to: z.number().int().min(0).optional().describe("Defaults to from (one word)."),
+        }),
+      )
+      .max(500)
+      .optional()
+      .describe("Word index ranges to cut, inclusive."),
+    removeRanges: z
+      .array(z.object({ startMs: z.number().int().min(0), endMs: z.number().int().min(1) }))
+      .max(500)
+      .optional()
+      .describe("Time ranges to cut, ms on the original timeline."),
+    removeFillerWords: z.boolean().optional().describe("Cut every um, uh, er and hmm."),
+    restoreWords: z
+      .array(
+        z.object({
+          from: z.number().int().min(0),
+          to: z.number().int().min(0).optional().describe("Defaults to from (one word)."),
+        }),
+      )
+      .max(500)
+      .optional()
+      .describe("Word index ranges to bring back, inclusive."),
+    restoreRanges: z
+      .array(z.object({ startMs: z.number().int().min(0), endMs: z.number().int().min(1) }))
+      .max(500)
+      .optional()
+      .describe("Time ranges to bring back, ms on the original timeline."),
+    restoreOriginal: z.boolean().optional().describe("Drop every cut before applying the rest."),
+    autoZoom: z
+      .boolean()
+      .optional()
+      .describe("Zoom in on recorded clicks, up to 40 zooms (Mac and Windows recordings only); omit to keep the current setting."),
+    expectedRevision: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Revision from get_edit_transcript; refused if the recording changed since."),
+    dryRun: z.boolean().optional().describe("Return the plan without changing anything."),
+  },
+  async ({ id, ...operations }) => {
+    try {
+      const pid = encodeURIComponent(normalizeId(id));
+      return ok(await apiPostJson(`/api/v1/recordings/${pid}/edit`, operations));
     } catch (e) {
       return fail((e as Error).message);
     }
