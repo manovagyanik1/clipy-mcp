@@ -3,8 +3,8 @@
   "name": "clipy",
   "display_name": "Clipy",
   "version": "0.10.0",
-  "description": "Read your Clipy screen recordings: search, transcripts, AI summaries, and key moments with frames.",
-  "long_description": "Clipy is an agent-readable screen recorder (free, no watermark — Mac, Chrome, web). This extension gives Claude access to your Clipy recordings: search your library, fetch timestamped transcripts, AI summaries, and key moments with the actual video frames (click markers burned in) as inline images. The `get_agent_context` tool bundles everything in one call — e.g. \"read this bug-report recording and ship the fix.\" Read tools need the default `recordings:read` scope; the record and transcript-edit tools require a key with the `ingest` scope (enforced server-side), so a `recordings:read`-only key can never create, modify, or delete recordings.",
+  "description": "Agent-native video context: search memory, read evidence, record sessions and make scoped edits.",
+  "long_description": "Clipy connects MCP-capable AI agents to recording and imported-video memory for bug reports, demos, and handoffs. Search with search_memory; read transcripts, AI summaries, key moments, agent-context bundles, and available browser diagnostics and interactions. With Playwright installed, capture and upload headless Chromium recordings or narrated recording sessions. Library reads use recordings:read; recording/session tools and replace_transcript additionally require ingest. Video editing and its edit transcript require recordings:write. Context documents are imported through the Clipy CLI and read through MCP; real desktop capture is CLI-only. Browser evidence depends on what the recording captured and is page-reported. A recordings:read-only key cannot create or modify recordings.",
   "author": {
     "name": "manovagyanik1",
     "email": "support@clipy.online",
@@ -19,13 +19,31 @@
     "url": "https://github.com/manovagyanik1/clipy-mcp"
   },
   "license": "MIT",
-  "keywords": ["screen-recording", "transcript", "video", "summary", "loom-alternative"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "clipy",
+    "ai-agent",
+    "agent-native",
+    "agent-context",
+    "video-context",
+    "screen-recording",
+    "semantic-search",
+    "browser-diagnostics",
+    "headless-recording",
+    "transcript",
+    "claude-code",
+    "codex",
+    "cursor"
+  ],
   "server": {
     "type": "node",
     "entry_point": "dist/index.js",
     "mcp_config": {
       "command": "node",
-      "args": ["${__dirname}/dist/index.js"],
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
       "env": {
         "CLIPY_API_KEY": "${user_config.api_key}"
       }
@@ -35,13 +53,17 @@
     "api_key": {
       "type": "string",
       "title": "Clipy API Key",
-      "description": "Create a free API key at https://clipy.online/settings/api-keys (looks like clipy_sk_live_…).",
+      "description": "Create a free API key at https://clipy.online/settings/api-keys (looks like clipy_sk_live_\u2026).",
       "sensitive": true,
       "required": true
     }
   },
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
     "runtimes": {
       "node": ">=18.0.0"
     }

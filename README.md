@@ -1,28 +1,52 @@
 # @clipy/mcp
 
-Give your AI agent access to your [Clipy](https://clipy.online) screen recordings.
+Agent-native video handoffs with [Clipy](https://clipy.online): search memory, read context,
+and capture or update recordings with scoped permissions.
 
 > Developed in the Clipy monorepo. A public mirror for browsing the source and filing
 > issues lives at **[github.com/manovagyanik1/clipy-mcp](https://github.com/manovagyanik1/clipy-mcp)**
 > (MIT), kept in sync with each npm release.
 
-This is a [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server. It lets
-Claude, Cursor, Windsurf, and other MCP-capable agents **search your recordings and read
-their transcripts and AI summaries** — so you can do things like _"turn this bug-report
-recording into a Linear ticket"_ without leaving your agent — and, with the `record`
-tool, **record a web app headlessly** and get it back as a Clipy recording (_"build the
-feature, then record the outcome"_).
+This [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server runs locally
+over stdio and connects Claude Code, Codex, Cursor, Windsurf, and other MCP-capable
+agents to Clipy. Use it to turn a bug-report recording into a fix or ticket, then
+record the result for another agent or a human to review.
+
+- **Find and read context:** `search_memory` searches recordings and imported-video
+  context documents. Read timestamped transcripts, AI summaries, key moments, and
+  `get_agent_context` bundles, plus available browser diagnostics and interaction
+  timelines. Evidence depends on what was captured and processed; browser diagnostics
+  are page-reported, and interaction coverage is reported by the tools.
+- **Capture a handoff:** `record` captures a web app headlessly; recording-session
+  tools let you add markers and chapters while you work, then upload or discard the
+  session. Capture requires Playwright and Chromium in the server's environment.
+- **Update a recording:** `replace_transcript` writes an agent-authored transcript
+  with revision checks; `edit_recording` applies transcript-based video cuts and
+  restorations with its separate editing permission.
+
+Context-document ingestion (YouTube or local video imports via `clipy context import`)
+and real desktop/screen capture are **CLI operations**. This MCP package reads imported
+context documents and captures headless Chromium pages; it does not expose a
+context-import tool or capture the actual desktop.
 
 The canonical cross-surface operating contract is
 **[clipy.online/agents.md](https://clipy.online/agents.md)**. For the exact
 connected MCP version and schemas, use the standard `tools/list` request.
+This package's local stdio tools should not be assumed to match the hosted MCP endpoint.
 
-The read tools need the `recordings:read` scope, which every key gets by default. The
-write tools — `record`, the session tools (`start_recording`, `add_marker`, `add_chapter`,
-`stop_recording`, `abort_recording`), and `replace_transcript` — additionally need the
-key to carry the `ingest` scope ("Record & upload"), which the server enforces. A
-`recordings:read`-only key can read your recordings but cannot create, modify, or
-delete anything.
+### Scope boundaries
+
+| Capability | Required API-key scope |
+| --- | --- |
+| Search and read recording/context libraries, context bundles, diagnostics and interactions | `recordings:read` (default) |
+| `record`, `start_recording`, `add_marker`, `add_chapter`, `stop_recording`, `abort_recording`, `replace_transcript` | Additionally `ingest` ("Record & upload") |
+| `get_edit_transcript`, `edit_recording` | `recordings:write` (video editing; the edit transcript includes removed words) |
+
+The API enforces resource access and scope permissions. A `recordings:read`-only key
+cannot create or modify recordings. `ingest` does not grant video-editing permission;
+`recordings:write` does not substitute for `ingest`. Aborting a session discards its
+local capture; it is not a library-recording deletion tool. Transcript replacement
+regenerates the summary and marks the text as agent-edited.
 
 ## Setup
 
@@ -107,6 +131,8 @@ always wins over the config file. Mint keys at
 | `list_recordings` | List your most recent recordings. |
 | `get_recording` | Metadata for one recording (status, duration, transcript/summary status). |
 | `get_transcript` | The full timestamped transcript + plaintext. |
+| `get_edit_transcript` | Read indexed words, removed words, cuts, and the edit revision on the original timeline. Requires `recordings:write`, even though it reads data. |
+| `edit_recording` | Apply transcript-based video cuts/restorations and optional click-based auto-zoom. Requires `recordings:write`; use `dryRun` to preview changes and `expectedRevision` to guard concurrent edits. Rendering and artifact regeneration are asynchronous. |
 | `get_summary` | The AI summary: TL;DR, key points, action items. |
 | `get_browser_diagnostics` | Privacy-redacted visited routes, console warnings/errors, page exceptions, and failed fetch/XHR metadata. The evidence is explicitly labelled page-reported; headers, bodies, cookies, tokens, typed values, and raw query values are never captured. |
 | `get_interactions` | Bounded pages of prepared routes, pointer samples, semantic clicks, derived drags, scroll bursts, pointer dwells, coarse typing (never values or exact key counts), and highlights. Filter by `fromMs`/`toMs`/`types`, set `limit` (1–250, default 100), and follow `pagination.nextCursor` with unchanged filters. Reports source coverage and preparation state; dwell is not proof of attention and coordinates belong to the capture viewport, not transformed playback frames. |

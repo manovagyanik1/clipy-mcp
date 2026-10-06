@@ -2,7 +2,7 @@
   "name": "@clipy/mcp",
   "version": "0.15.1",
   "mcpName": "online.clipy/mcp",
-  "description": "Model Context Protocol (MCP) server for Clipy \u2014 give Claude, Cursor, and other AI agents read access to your screen recordings' transcripts, AI summaries, and key moments with frames.",
+  "description": "Clipy MCP server for agent-native video handoffs: search recording and imported-video memory, read context and browser evidence, record headless sessions, and update transcripts or edit recordings with scoped permissions.",
   "license": "MIT",
   "type": "module",
   "publishConfig": {
@@ -22,12 +22,18 @@
     "mcp",
     "model-context-protocol",
     "clipy",
-    "screen-recording",
-    "transcript",
     "ai-agent",
-    "claude",
-    "cursor",
-    "loom-alternative"
+    "agent-native",
+    "agent-context",
+    "video-context",
+    "screen-recording",
+    "semantic-search",
+    "browser-diagnostics",
+    "headless-recording",
+    "transcript",
+    "claude-code",
+    "codex",
+    "cursor"
   ],
   "scripts": {
     "build": "tsc",
