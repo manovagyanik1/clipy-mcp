@@ -20,9 +20,9 @@ connected MCP version and schemas, use the standard `tools/list` request.
 The read tools need the `recordings:read` scope, which every key gets by default. The
 write tools — `record`, the session tools (`start_recording`, `add_marker`, `add_chapter`,
 `stop_recording`, `abort_recording`), and `replace_transcript` — additionally need the
-key to carry the `ingest` scope ("Record & upload"), which the server enforces. A
-`recordings:read`-only key can read your recordings but cannot create, modify, or
-delete anything.
+key to carry the `ingest` scope ("Record & upload"), which the server enforces.
+`get_edit_transcript` and `edit_recording` need the `recordings:write` scope. A `recordings:read`-only key can
+read your recordings but cannot create, modify, or delete anything.
 
 ## Setup
 
@@ -98,6 +98,22 @@ always wins over the config file. Mint keys at
 > for you — they expose the key only in the argv of that single setup command, never in the
 > long-running server's.)
 
+## Hosted connector
+
+You can also connect without installing anything. Clipy runs this server at
+`https://clipy.online/api/mcp` (Streamable HTTP).
+
+- Connector UIs such as Claude and ChatGPT sign in with OAuth. Discovery starts at
+  `https://clipy.online/.well-known/oauth-protected-resource`.
+- Other clients send `Authorization: Bearer <Clipy API key>`.
+- A key with only the `recordings:read` scope sees only the read tools.
+
+## For MCP directories and reviewers
+
+Clipy keeps a demo account with three sample recordings: a bug walkthrough, UI feedback
+and a product demo. Directories can get a read-only test key by emailing
+support@clipy.online.
+
 ## Tools
 
 | Tool | What it does |
@@ -108,6 +124,8 @@ always wins over the config file. Mint keys at
 | `get_recording` | Metadata for one recording (status, duration, transcript/summary status). |
 | `get_transcript` | The full timestamped transcript + plaintext. |
 | `get_summary` | The AI summary: TL;DR, key points, action items. |
+| `get_edit_transcript` | The recording as an **editable transcript** (needs the `recordings:write` scope, since it includes the text of cut words): every word with its index, start/end in ms on the original timeline, a `filler` flag (um, uh, er, hmm) and `removed` on words the current version already cuts, plus the `revision` to pass to `edit_recording`. Paged by `fromWord`/`limit`. |
+| `edit_recording` | **Edit the video by its transcript** (needs the `recordings:write` scope): cut word ranges or ms ranges, remove every filler word, bring cuts back, or turn on click auto zoom (`autoZoom`, Mac and Windows recordings). Clipy keeps the original, so a cut can be brought back until the owner deletes the original; the share link stays the same and switches to the new version when the render finishes. Supports `dryRun` and `expectedRevision`. |
 | `get_browser_diagnostics` | Privacy-redacted visited routes, console warnings/errors, page exceptions, and failed fetch/XHR metadata. The evidence is explicitly labelled page-reported; headers, bodies, cookies, tokens, typed values, and raw query values are never captured. |
 | `get_interactions` | Bounded pages of prepared routes, pointer samples, semantic clicks, derived drags, scroll bursts, pointer dwells, coarse typing (never values or exact key counts), and highlights. Filter by `fromMs`/`toMs`/`types`, set `limit` (1–250, default 100), and follow `pagination.nextCursor` with unchanged filters. Reports source coverage and preparation state; dwell is not proof of attention and coordinates belong to the capture viewport, not transformed playback frames. |
 | `wait_for_artifacts` | Poll until a recording's transcript/summary finish processing. |
@@ -129,8 +147,8 @@ Read tools accept a recording's **public id** (the slug in its share URL) or the
 `https://clipy.online/video/<id>` URL.
 
 > **Capturing the real screen is CLI-only.** These tools record a headless Chromium page.
-> To record the actual Mac screen or a window's initial screen area (ScreenCaptureKit — the real
-> logged-in browser), use the Clipy CLI: `clipy record --source mac-screen --window "<app>"`.
+> To record the actual screen or a single app window (the Mac app on macOS, the X display on Linux; the real
+> logged-in browser), use the Clipy CLI: `clipy record --source screen --window "<app>"`.
 
 ### Using `record`
 
@@ -171,13 +189,13 @@ cross-origin auth). For a full identity, pass `userDataDir` — Chrome's **user-
   > `Preferences`-based sessions still work. This is a pre-existing Playwright-vs-Chrome
   > constraint, not something the copy introduces, and the copy disclosure repeats it. **If the
   > recording lands logged out, that's why.** Record the real browser with the CLI's
-  > `clipy record --source mac-screen`, or drive your own browser and attach evidence via
+  > `clipy record --source screen`, or drive your own browser and attach evidence via
   > `add_marker`'s `observed`/`verdict`.
 - **Open the `Default` profile directly.** Omit `profileDirectory`. Clipy opens the root's
   `Default` profile **and writes to it**, so it's refused while a live Chrome holds it locked —
   quit Chrome first. When the dir looks like a real Chrome root, the result carries a
   `userDataDirWarning` saying so and pointing you at `profileDirectory` (ephemeral copy) or the
-  CLI's `--source mac-screen` instead. Prefer those unless you specifically want in-place use.
+  CLI's `--source screen` instead. Prefer those unless you specifically want in-place use.
 
 > Playwright **strips** Chromium's `--profile-directory` (it always loads `Default` from whatever
 > dir it's given), so copying is the only way to record a named profile. Pointing `userDataDir`
@@ -208,8 +226,8 @@ footage of the wrong thing. **Clipy will never focus or foreground a window or t
 pointing the driver and the camera at the same surface is the caller's job.
 
 `kind` is always `headless_browser` here: these tools record a headless page Clipy owns.
-Capturing a real application's initial screen area or a display is CLI-only
-(`clipy record --source mac-screen --window "<app>"`), so no window id or window title is
+Capturing a real application window or a display is CLI-only
+(`clipy record --source screen --window "<app>"`), so no window id or window title is
 reported — an empty or invented one would be exactly the kind of false confidence this
 field exists to prevent.
 
@@ -224,7 +242,7 @@ separately, never pooled:
 | **driver-attested** | `observed` + `verdict` (both required) | *You* report what your own tooling saw. Clipy vouches only that you **said** it — not that it verified it — which is falsifiable against the recorded frames. Renders with a **hedge glyph** rather than a verdict glyph: `[≈ ASSERT driver-attested; observed=…]`, or `[≈ FAILED driver-attested; observed=…]`. |
 
 Use **driver-attested** when your agent drives its own browser/tooling while Clipy records (e.g.
-`--source mac-screen` on the CLI) or when there's no Clipy-owned page to assert against. It's
+`--source screen` on the CLI) or when there's no Clipy-owned page to assert against. It's
 weaker than clipy-verified but far stronger than plain prose. The transcript's leading
 `[verification]` note segments the two, e.g.
 `[verification] 3 clipy-verified: 2 passed, 1 failed · 2 driver-attested: 2 passed, 0 failed`.
