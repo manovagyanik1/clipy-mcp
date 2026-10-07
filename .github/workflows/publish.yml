@@ -23,9 +23,18 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build
-      - run: npm publish --access public
+      # Skips a version npm already has, so "Re-run failed jobs" can retry the
+      # registry step below instead of dying on npm's E403 for a re-publish.
+      - name: Publish to npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if npm view "@clipy/mcp@${VERSION}" version >/dev/null 2>&1; then
+            echo "@clipy/mcp@${VERSION} is already on npm; skipping npm publish."
+          else
+            npm publish --access public
+          fi
 
       # The MCP Registry (registry.modelcontextprotocol.io) is a public
       # discovery listing that POINTS AT the npm package — it hosts no code, so
@@ -62,11 +71,21 @@ jobs:
           # npm's registry is read-through cached; the MCP Registry validates
           # that the package version resolves before it will accept the entry.
           VERSION="$(node -p "require('./package.json').version")"
-          for i in 1 2 3 4 5 6; do
+          # npm now says a new release "may take a few minutes to become
+          # available", and the 60 s this used to wait failed 0.15.1 and 0.16.0.
+          for i in $(seq 1 30); do
             if npm view "@clipy/mcp@${VERSION}" version >/dev/null 2>&1; then break; fi
-            echo "waiting for @clipy/mcp@${VERSION} to appear on npm (attempt $i)…"
-            sleep 10
+            echo "waiting for @clipy/mcp@${VERSION} to appear on npm (attempt $i of 30)"
+            sleep 20
           done
 
-          ./mcp-publisher login http --domain clipy.online --private-key "$MCP_REGISTRY_KEY"
-          ./mcp-publisher publish
+          # The registry resolves the version through its own npm lookup, which
+          # can lag the one above. Retry rather than fail on that lag; log in on
+          # every attempt because the login token only lasts about 5 minutes.
+          for i in 1 2 3 4 5; do
+            ./mcp-publisher login http --domain clipy.online --private-key "$MCP_REGISTRY_KEY"
+            if ./mcp-publisher publish; then exit 0; fi
+            echo "registry publish failed (attempt $i of 5); retrying in 60 s" >&2
+            sleep 60
+          done
+          exit 1
